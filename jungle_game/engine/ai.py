@@ -4,15 +4,16 @@ Features:
 - Iterative deepening with time limit
 - Alpha-beta pruning (fail-soft)
 - Move ordering (captures first via MVV-LVA, den-entry moves)
-- Transposition table with Zobrist hashing
-- Evaluation: material + position + mobility + trap control
+- Transposition table with Zobrist hashing (persistent across moves)
+- Quiescence search to avoid horizon effect
+- Evaluation: material + position + threats + trap control
 """
 
 from __future__ import annotations
 import time
 import random
 from jungle_game.engine.pieces import PieceType, Player
-from jungle_game.engine.rules import generate_legal_moves, check_win
+from jungle_game.engine.rules import generate_legal_moves, check_win, is_capture_valid
 
 # Piece material values (tuned for Jungle)
 PIECE_VALUES = {
@@ -32,6 +33,19 @@ PIECE_VALUES = {
 DEN_POSITIONS = {
     Player.BLUE: (3, 8),
     Player.RED: (3, 0),
+}
+
+# Piece advancement multipliers: higher-rank pieces get more bonus for advancing
+# Rat gets a bonus too because it can capture Elephant
+ADVANCE_MULTIPLIER = {
+    PieceType.RAT: 1.2,
+    PieceType.CAT: 0.8,
+    PieceType.DOG: 0.9,
+    PieceType.WOLF: 1.0,
+    PieceType.LEOPARD: 1.0,
+    PieceType.TIGER: 1.3,
+    PieceType.LION: 1.4,
+    PieceType.ELEPHANT: 1.0,
 }
 
 # Zobrist hashing for transposition table
@@ -81,6 +95,9 @@ def evaluate(game_state, player: Player) -> int:
     target_den = DEN_POSITIONS[player]
     own_den = DEN_POSITIONS[opp]  # Opponent's den = our own den area
 
+    # Build position lookup for threat analysis
+    pieces_by_pos = game_state.pieces_by_pos
+
     for piece in game_state.pieces:
         value = PIECE_VALUES[piece.piece_type]
 
@@ -89,18 +106,29 @@ def evaluate(game_state, player: Player) -> int:
             score += value
 
             # Position: bonus for being closer to opponent's den
+            # Weighted by piece type — high-rank and Rat advance more aggressively
             dist_to_den = abs(piece.col - target_den[0]) + abs(piece.row - target_den[1])
-            score += (16 - dist_to_den) * 10  # Max bonus ~160
+            multiplier = ADVANCE_MULTIPLIER.get(piece.piece_type, 1.0)
+            score += int((16 - dist_to_den) * 20 * multiplier)
 
             # Penalty for being near own den (we want to advance, not defend)
             dist_from_own = abs(piece.col - own_den[0]) + abs(piece.row - own_den[1])
             if dist_from_own < 3:
-                score -= (3 - dist_from_own) * 15
+                score -= (3 - dist_from_own) * 25
 
-            # Trap control: bonus if threatening opponent's trapped pieces
-            # and penalty if our piece is in opponent's trap
+            # Penalty if our piece is in opponent's trap (weakened to rank 0)
             if board.is_opponent_trap(piece.col, piece.row, piece.player):
-                score -= value // 2  # Our piece is weakened
+                score -= value // 2
+
+            # Bonus for threatening to capture adjacent opponent pieces
+            for dc, dr in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                nc, nr = piece.col + dc, piece.row + dr
+                target = pieces_by_pos.get((nc, nr))
+                if target is not None and target.player == opp:
+                    if is_capture_valid(piece.piece_type, piece.player,
+                                        piece.col, piece.row, target, board):
+                        # Bonus proportional to the value of the threatened piece
+                        score += PIECE_VALUES[target.piece_type] // 4
 
         else:
             # Opponent's piece
@@ -108,16 +136,20 @@ def evaluate(game_state, player: Player) -> int:
 
             # Position: opponent closer to our den is threatening
             dist_to_our_den = abs(piece.col - own_den[0]) + abs(piece.row - own_den[1])
-            score -= (16 - dist_to_our_den) * 8  # Threat factor
+            score -= int((16 - dist_to_our_den) * 15)
 
-            # Opponent in our trap = good for us
+            # Opponent in our trap = good for us (they're weakened)
             if board.is_opponent_trap(piece.col, piece.row, piece.player):
                 score += value // 2
 
-    # Mobility: count legal moves for both sides
-    player_moves = len(generate_legal_moves(game_state, player))
-    opp_moves = len(generate_legal_moves(game_state, opp))
-    score += (player_moves - opp_moves) * 5
+            # Penalty if opponent threatens to capture our pieces
+            for dc, dr in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                nc, nr = piece.col + dc, piece.row + dr
+                target = pieces_by_pos.get((nc, nr))
+                if target is not None and target.player == player:
+                    if is_capture_valid(piece.piece_type, piece.player,
+                                        piece.col, piece.row, target, board):
+                        score -= PIECE_VALUES[target.piece_type] // 5
 
     return score
 
@@ -192,8 +224,104 @@ class TranspositionTable:
         self._table.clear()
 
 
+# Persistent transposition table — survives across moves for better performance
+_tt = TranspositionTable()
+
+
+def clear_tt():
+    """Clear the persistent transposition table (call between games)."""
+    _tt.clear()
+
+
+def _quiescence(game_state, alpha: int, beta: int, maximizing: bool,
+                player: Player, start_time: float, time_limit: float,
+                q_depth: int = 0, max_q_depth: int = 3) -> int:
+    """Quiescence search: extend search on captures to avoid horizon effect.
+
+    Only explores capture moves and den-entry moves to resolve tactical
+    sequences before falling back to static evaluation.
+    """
+    # Time check
+    if time.time() - start_time > time_limit:
+        return evaluate(game_state, player)
+
+    # Stand pat: the static evaluation is a lower bound
+    stand_pat = evaluate(game_state, player)
+
+    # If the game is already over, return terminal evaluation immediately
+    if game_state.is_over:
+        return stand_pat
+
+    if maximizing:
+        if stand_pat >= beta:
+            return stand_pat
+        if stand_pat > alpha:
+            alpha = stand_pat
+    else:
+        if stand_pat <= alpha:
+            return stand_pat
+        if stand_pat < beta:
+            beta = stand_pat
+
+    # Depth limit for quiescence
+    if q_depth >= max_q_depth:
+        return stand_pat
+
+    current = game_state.current_player
+    moves = generate_legal_moves(game_state, current)
+
+    # Filter to only captures and den-entry moves
+    capture_moves = []
+    pieces_by_pos = game_state.pieces_by_pos
+    for from_pos, to_pos in moves:
+        target = pieces_by_pos.get(to_pos)
+        if target is not None:
+            capture_moves.append((from_pos, to_pos))
+        elif game_state.board.is_opponent_den(to_pos[0], to_pos[1], current):
+            # Den entry is always worth searching
+            capture_moves.append((from_pos, to_pos))
+
+    if not capture_moves:
+        return stand_pat
+
+    capture_moves = order_moves(capture_moves, game_state)
+
+    if maximizing:
+        max_eval = stand_pat
+        for from_pos, to_pos in capture_moves:
+            if time.time() - start_time > time_limit:
+                break
+            game_state.make_move(from_pos, to_pos, skip_validation=True)
+            eval_score = _quiescence(game_state, alpha, beta, False, player,
+                                     start_time, time_limit, q_depth + 1,
+                                     max_q_depth)
+            game_state.undo_move()
+            if eval_score > max_eval:
+                max_eval = eval_score
+            alpha = max(alpha, eval_score)
+            if beta <= alpha:
+                break
+        return max_eval
+    else:
+        min_eval = stand_pat
+        for from_pos, to_pos in capture_moves:
+            if time.time() - start_time > time_limit:
+                break
+            game_state.make_move(from_pos, to_pos, skip_validation=True)
+            eval_score = _quiescence(game_state, alpha, beta, True, player,
+                                     start_time, time_limit, q_depth + 1,
+                                     max_q_depth)
+            game_state.undo_move()
+            if eval_score < min_eval:
+                min_eval = eval_score
+            beta = min(beta, eval_score)
+            if beta <= alpha:
+                break
+        return min_eval
+
+
 def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
-                maximizing: bool, player: Player, tt: TranspositionTable,
+                maximizing: bool, player: Player,
                 start_time: float, time_limit: float) -> int:
     """Alpha-beta search with transposition table."""
 
@@ -204,7 +332,7 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
     hash_key = compute_zobrist_hash(game_state)
 
     # Transposition table lookup
-    tt_entry = tt.lookup(hash_key, depth)
+    tt_entry = _tt.lookup(hash_key, depth)
     if tt_entry is not None:
         score, flag, _ = tt_entry
         if flag == EXACT:
@@ -224,7 +352,8 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
         return -100000 - depth  # Prefer slower losses
 
     if depth == 0:
-        return evaluate(game_state, player)
+        return _quiescence(game_state, alpha, beta, maximizing, player,
+                           start_time, time_limit)
 
     current = game_state.current_player
     moves = generate_legal_moves(game_state, current)
@@ -250,9 +379,10 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
         for from_pos, to_pos in moves:
             if time.time() - start_time > time_limit:
                 break
-            captured = game_state.make_move(from_pos, to_pos)
+            captured = game_state.make_move(from_pos, to_pos,
+                                           skip_validation=True)
             eval_score = _alpha_beta(game_state, depth - 1, alpha, beta,
-                                     False, player, tt, start_time, time_limit)
+                                     False, player, start_time, time_limit)
             game_state.undo_move()
 
             if eval_score > max_eval:
@@ -263,7 +393,7 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
             if beta <= alpha:
                 break
 
-        tt.store(hash_key, depth, max_eval,
+        _tt.store(hash_key, depth, max_eval,
                  EXACT if max_eval > alpha and max_eval < beta
                  else (LOWERBOUND if max_eval >= beta else UPPERBOUND),
                  best_move)
@@ -273,9 +403,10 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
         for from_pos, to_pos in moves:
             if time.time() - start_time > time_limit:
                 break
-            captured = game_state.make_move(from_pos, to_pos)
+            captured = game_state.make_move(from_pos, to_pos,
+                                           skip_validation=True)
             eval_score = _alpha_beta(game_state, depth - 1, alpha, beta,
-                                     True, player, tt, start_time, time_limit)
+                                     True, player, start_time, time_limit)
             game_state.undo_move()
 
             if eval_score < min_eval:
@@ -286,7 +417,7 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
             if beta <= alpha:
                 break
 
-        tt.store(hash_key, depth, min_eval,
+        _tt.store(hash_key, depth, min_eval,
                  EXACT if min_eval > alpha and min_eval < beta
                  else (LOWERBOUND if min_eval >= beta else UPPERBOUND),
                  best_move)
@@ -309,20 +440,18 @@ def find_best_move(game_state, player: Player = None,
     if len(moves) == 1:
         return moves[0]
 
-    tt = TranspositionTable()
     start_time = time.time()
     time_limit = time_limit_ms / 1000.0
 
     best_move = moves[0]
-    maximizing = (player == Player.BLUE)
 
-    # Iterative deepening
+    # Iterative deepening — AI always maximizes its own evaluation
     for depth in range(1, 20):
         if time.time() - start_time > time_limit * 0.8:
             break
 
         current_best = None
-        current_best_score = -999999 if maximizing else 999999
+        current_best_score = -999999
 
         ordered_moves = order_moves(moves, game_state)
 
@@ -335,20 +464,16 @@ def find_best_move(game_state, player: Player = None,
             if time.time() - start_time > time_limit * 0.9:
                 break
 
-            captured = game_state.make_move(from_pos, to_pos)
+            captured = game_state.make_move(from_pos, to_pos,
+                                           skip_validation=True)
             score = _alpha_beta(game_state, depth - 1, -999999, 999999,
-                                not maximizing, player, tt, start_time,
+                                False, player, start_time,
                                 time_limit - (time.time() - start_time))
             game_state.undo_move()
 
-            if maximizing:
-                if score > current_best_score:
-                    current_best_score = score
-                    current_best = (from_pos, to_pos)
-            else:
-                if score < current_best_score:
-                    current_best_score = score
-                    current_best = (from_pos, to_pos)
+            if score > current_best_score:
+                current_best_score = score
+                current_best = (from_pos, to_pos)
 
         if current_best is not None:
             best_move = current_best

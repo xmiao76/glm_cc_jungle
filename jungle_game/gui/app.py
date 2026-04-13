@@ -7,7 +7,7 @@ import time
 
 from jungle_game.engine.game import GameState
 from jungle_game.engine.pieces import Player, PieceType
-from jungle_game.engine.ai import find_best_move
+from jungle_game.engine.ai import find_best_move, clear_tt
 from jungle_game.engine.rules import generate_legal_moves
 from jungle_game.gui.board_renderer import BoardRenderer
 from jungle_game.gui.piece_renderer import PieceRenderer
@@ -75,6 +75,7 @@ class JungleApp:
             self.mode = mode
         else:
             self.mode = self.MODE_HUMAN_VS_AI
+        clear_tt()  # Reset transposition table for new game
         self.game = GameState()
         self.selected_pos = None
         self.legal_moves_for_selected = []

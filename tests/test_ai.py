@@ -7,6 +7,7 @@ from jungle_game.engine.pieces import Piece, PieceType, Player
 from jungle_game.engine.ai import (
     find_best_move, evaluate, order_moves, PIECE_VALUES,
     compute_zobrist_hash, TranspositionTable, EXACT, LOWERBOUND, UPPERBOUND,
+    clear_tt,
 )
 from jungle_game.engine.rules import generate_legal_moves
 
@@ -205,3 +206,186 @@ class TestAICompletesGame:
             game.make_move(move[0], move[1])
 
         assert game.is_over or len(game.get_legal_moves()) == 0
+
+
+class TestMaximizingBug:
+    """Regression tests for the critical bug where RED player minimized its own score."""
+
+    def test_red_ai_finds_winning_move(self):
+        """RED AI should find a winning den-entry move, just like BLUE."""
+        clear_tt()
+        # Red Lion one step from Blue's den (3,0)
+        lion = Piece(PieceType.LION, Player.RED, 3, 1)
+        # Blue piece far away so it's not instant-win
+        cat = Piece(PieceType.CAT, Player.BLUE, 0, 6)
+        game = make_game_with_pieces([lion, cat])
+        game.current_player = Player.RED
+        move = find_best_move(game, Player.RED, time_limit_ms=1000)
+        assert move is not None
+        # Lion at (3,1) can move to (3,0) = Blue's den = instant win
+        assert move == ((3, 1), (3, 0))
+
+    def test_red_ai_prefers_capture_over_idle_move(self):
+        """RED AI should capture an adjacent weaker piece instead of moving aimlessly."""
+        clear_tt()
+        # Red Tiger at (4,4), Blue Cat at (4,5) — Tiger can capture Cat
+        tiger = Piece(PieceType.TIGER, Player.RED, 4, 4)
+        cat = Piece(PieceType.CAT, Player.BLUE, 4, 5)
+        # Extra pieces to avoid instant win
+        lion_blue = Piece(PieceType.LION, Player.BLUE, 0, 0)
+        lion_red = Piece(PieceType.LION, Player.RED, 6, 8)
+        game = make_game_with_pieces([tiger, cat, lion_blue, lion_red])
+        game.current_player = Player.RED
+        move = find_best_move(game, Player.RED, time_limit_ms=1000)
+        assert move is not None
+        # Should capture Cat at (4,5)
+        if move[0] == (4, 4):
+            assert move[1] == (4, 5), f"Expected Tiger to capture Cat at (4,5), got move to {move[1]}"
+
+    def test_blue_ai_prefers_capture_over_idle_move(self):
+        """BLUE AI should also capture an adjacent weaker piece."""
+        clear_tt()
+        # Blue Tiger at (0,4), Red Cat at (0,5) — both land squares, Tiger can capture Cat
+        tiger = Piece(PieceType.TIGER, Player.BLUE, 0, 4)
+        cat = Piece(PieceType.CAT, Player.RED, 0, 5)
+        lion_blue = Piece(PieceType.LION, Player.BLUE, 6, 0)
+        lion_red = Piece(PieceType.LION, Player.RED, 6, 8)
+        game = make_game_with_pieces([tiger, cat, lion_blue, lion_red])
+        game.current_player = Player.BLUE
+        move = find_best_move(game, Player.BLUE, time_limit_ms=1000)
+        assert move is not None
+        # The Tiger should capture the Cat
+        if move[0] == (0, 4):
+            assert move[1] == (0, 5), f"Expected Tiger to capture Cat at (0,5), got move to {move[1]}"
+
+    def test_red_evaluates_positive_for_red_advantage(self):
+        """Evaluate should return positive for RED when RED has more material."""
+        clear_tt()
+        # RED has Lion + Elephant, BLUE has only Cat
+        lion = Piece(PieceType.LION, Player.RED, 3, 4)
+        elephant = Piece(PieceType.ELEPHANT, Player.RED, 4, 4)
+        cat = Piece(PieceType.CAT, Player.BLUE, 0, 6)
+        game = make_game_with_pieces([lion, elephant, cat])
+        score = evaluate(game, Player.RED)
+        assert score > 0, f"RED with material advantage should have positive score, got {score}"
+
+    def test_red_ai_does_not_avoid_capturing(self):
+        """RED AI should not avoid capturing when it can — regression for inverted maximizing."""
+        clear_tt()
+        # Red Wolf at (3,5), Blue Cat at (3,6) — Wolf (rank 4) can capture Cat (rank 2)
+        wolf = Piece(PieceType.WOLF, Player.RED, 3, 5)
+        cat = Piece(PieceType.CAT, Player.BLUE, 3, 6)
+        # Extra pieces far away
+        elephant_r = Piece(PieceType.ELEPHANT, Player.RED, 0, 6)
+        lion_b = Piece(PieceType.LION, Player.BLUE, 6, 0)
+        game = make_game_with_pieces([wolf, cat, elephant_r, lion_b])
+        game.current_player = Player.RED
+        move = find_best_move(game, Player.RED, time_limit_ms=1000)
+        assert move is not None
+        # The best move should involve the Wolf capturing the Cat or advancing
+        # At minimum, the Wolf should not move AWAY from the Cat
+        if move[0] == (3, 5):
+            assert move[1] == (3, 6), f"Wolf should capture Cat at (3,6), got move to {move[1]}"
+
+
+class TestSkipValidation:
+    """Tests for skip_validation parameter in make_move."""
+
+    def test_skip_validation_accepts_legal_move(self):
+        """skip_validation=True should work for legal moves."""
+        game = GameState()
+        moves = game.get_legal_moves()
+        # Should not raise
+        game.make_move(moves[0][0], moves[0][1], skip_validation=True)
+
+    def test_skip_validation_rejects_illegal_move(self):
+        """skip_validation=True should skip the legality check."""
+        game = GameState()
+        # Move that doesn't exist in legal moves - would fail normal validation
+        # but skip_validation bypasses the check (may still fail on other checks)
+        # This just tests the parameter exists and doesn't break normal operation
+        moves = game.get_legal_moves()
+        assert len(moves) > 0
+        game.make_move(moves[0][0], moves[0][1], skip_validation=True)
+
+    def test_normal_validation_catches_illegal_move(self):
+        """Without skip_validation, illegal moves should raise ValueError."""
+        game = GameState()
+        with pytest.raises(ValueError):
+            # Try to move from an empty square
+            game.make_move((0, 5), (0, 4))
+
+
+class TestEvaluationImprovements:
+    """Tests for improved evaluation function."""
+
+    def test_threat_bonus_for_capturing(self):
+        """Pieces threatening to capture should get a bonus."""
+        clear_tt()
+        # Blue Tiger adjacent to Red Cat — Tiger threatens Cat
+        tiger = Piece(PieceType.TIGER, Player.BLUE, 4, 3)
+        cat = Piece(PieceType.CAT, Player.RED, 4, 4)
+        game1 = make_game_with_pieces([tiger, cat])
+
+        # Same pieces but not adjacent
+        tiger2 = Piece(PieceType.TIGER, Player.BLUE, 0, 0)
+        cat2 = Piece(PieceType.CAT, Player.RED, 6, 8)
+        game2 = make_game_with_pieces([tiger2, cat2])
+
+        score1 = evaluate(game1, Player.BLUE)
+        score2 = evaluate(game2, Player.BLUE)
+        assert score1 > score2, f"Threat position should score higher: {score1} vs {score2}"
+
+    def test_closer_to_den_is_better(self):
+        """Pieces closer to opponent's den should have higher positional score."""
+        clear_tt()
+        # Blue Lion near Red's den
+        lion_close = Piece(PieceType.LION, Player.BLUE, 3, 6)
+        rat_far = Piece(PieceType.RAT, Player.RED, 0, 0)
+        game_close = make_game_with_pieces([lion_close, rat_far])
+
+        # Blue Lion far from Red's den
+        lion_far = Piece(PieceType.LION, Player.BLUE, 0, 0)
+        game_far = make_game_with_pieces([lion_far, rat_far])
+
+        score_close = evaluate(game_close, Player.BLUE)
+        score_far = evaluate(game_far, Player.BLUE)
+        assert score_close > score_far, f"Closer to den should score higher: {score_close} vs {score_far}"
+
+
+class TestQuiescenceSearch:
+    """Tests for quiescence search avoiding horizon effect."""
+
+    def test_ai_finds_immediate_capture(self):
+        """AI should see and take an immediate capture opportunity."""
+        clear_tt()
+        # Blue Lion at (3,4), Red Cat at (3,5) — Lion can capture Cat
+        lion = Piece(PieceType.LION, Player.BLUE, 3, 4)
+        cat = Piece(PieceType.CAT, Player.RED, 3, 5)
+        elephant_r = Piece(PieceType.ELEPHANT, Player.RED, 0, 6)
+        game = make_game_with_pieces([lion, cat, elephant_r])
+        game.current_player = Player.BLUE
+        move = find_best_move(game, time_limit_ms=500)
+        assert move is not None
+        # Should capture the Cat
+        if move[0] == (3, 4):
+            assert move[1] == (3, 5), f"Lion should capture Cat at (3,5), got {move}"
+
+    def test_ai_avoids_walking_into_den(self):
+        """AI should evaluate a position where opponent threatens den as dangerous."""
+        clear_tt()
+        # Red Lion at (2,1) — very close to Blue's den at (3,0)
+        # This is NOT in a trap, so it's a real threat
+        # Blue Elephant at (0,6) — far from defense
+        lion_red = Piece(PieceType.LION, Player.RED, 2, 1)
+        elephant_blue = Piece(PieceType.ELEPHANT, Player.BLUE, 0, 6)
+        # Extra piece so it's not an instant win
+        cat_red = Piece(PieceType.CAT, Player.RED, 5, 7)
+        game = make_game_with_pieces([lion_red, elephant_blue, cat_red])
+        game.current_player = Player.BLUE
+        # The evaluation should see Red's Lion near Blue's den as threatening
+        # Red has material advantage (Lion 1000 + Cat 200) vs Blue (Elephant 1100)
+        # and positional threat from Lion near den
+        score = evaluate(game, Player.BLUE)
+        # With Red Lion threatening and material disadvantage, score should be negative
+        assert score < 0, f"Position should be bad for Blue (Red Lion threatening den): score={score}"

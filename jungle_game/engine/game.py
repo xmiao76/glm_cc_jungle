@@ -45,8 +45,13 @@ class GameState:
     def is_over(self) -> bool:
         return self._winner is not None
 
-    def make_move(self, from_pos: tuple[int, int], to_pos: tuple[int, int]):
+    def make_move(self, from_pos: tuple[int, int], to_pos: tuple[int, int],
+                  skip_validation: bool = False):
         """Execute a move. Returns the captured piece if any, or None.
+
+        Args:
+            skip_validation: If True, skip the legal-move check. Use in AI search
+                where moves are already known to be legal. Defaults to False.
 
         Raises ValueError if the move is illegal.
         """
@@ -59,10 +64,11 @@ class GameState:
         if piece.player != self.current_player:
             raise ValueError(f"Not {piece.player}'s turn")
 
-        # Verify move is legal
-        legal_moves = generate_legal_moves(self, self.current_player)
-        if (from_pos, to_pos) not in legal_moves:
-            raise ValueError(f"Illegal move: {from_pos} -> {to_pos}")
+        # Verify move is legal (skipped during AI search for performance)
+        if not skip_validation:
+            legal_moves = generate_legal_moves(self, self.current_player)
+            if (from_pos, to_pos) not in legal_moves:
+                raise ValueError(f"Illegal move: {from_pos} -> {to_pos}")
 
         captured = self._pieces_by_pos.get(to_pos)
 
