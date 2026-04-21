@@ -2,22 +2,75 @@
 
 import pygame
 import sys
+import ctypes
 import threading
 import time
 
 from jungle_game.engine.game import GameState
-from jungle_game.engine.pieces import Player, PieceType
+from jungle_game.engine.pieces import Player
 from jungle_game.engine.ai import find_best_move, clear_tt
 from jungle_game.engine.rules import generate_legal_moves
+from jungle_game.engine.board import COLS, ROWS
 from jungle_game.gui.board_renderer import BoardRenderer
 from jungle_game.gui.piece_renderer import PieceRenderer
 from jungle_game.gui.ui_overlay import UIOverlay
 
 # Window settings
 SIDEBAR_WIDTH = 200
+BORDER_WIDTH = 12
 FPS = 60
 AI_TIME_LIMIT_MS = 1500
 AI_VS_AI_DELAY_MS = 500  # Delay between AI moves in AI-vs-AI mode
+TITLE_BAR_HEIGHT = 40    # Windows title bar
+SAFETY_PAD = 10          # Extra safety margin so window isn't edge-to-edge
+
+
+def _get_work_area() -> tuple[int, int]:
+    """Get the Windows work area (screen minus taskbar) in pixels.
+
+    Returns (width, height). Falls back to pygame display info on failure.
+    """
+    try:
+        class RECT(ctypes.Structure):
+            _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                         ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+        rect = RECT()
+        # SPI_GETWORKAREA = 0x30
+        ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(rect), 0)
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    # Fallback: use pygame display info (full screen, not work area)
+    try:
+        info = pygame.display.Info()
+        return info.current_w, info.current_h
+    except Exception:
+        return 0, 0
+
+
+def _compute_cell_size() -> int:
+    """Compute the largest cell_size that fits the screen.
+
+    Uses the Windows work area (excludes taskbar) and reserves room for
+    the window title bar. Falls back to 72 if detection fails.
+    """
+    work_w, work_h = _get_work_area()
+    if work_w <= 0 or work_h <= 0:
+        return 72
+
+    # Available space for the Pygame window content
+    available_h = work_h - TITLE_BAR_HEIGHT - SAFETY_PAD
+    available_w = work_w - SAFETY_PAD
+
+    # Height constraint: (ROWS * cell) + 2 * border <= available_h
+    max_from_h = (available_h - 2 * BORDER_WIDTH) // ROWS
+    # Width constraint: (COLS * cell) + 2 * border + sidebar <= available_w
+    max_from_w = (available_w - 2 * BORDER_WIDTH - SIDEBAR_WIDTH) // COLS
+    cell = min(max_from_h, max_from_w)
+    return max(40, min(cell, 72))
 
 
 class CaptureAnimation:
@@ -55,8 +108,9 @@ class JungleApp:
         with contextlib.redirect_stdout(None):
             pygame.init()
 
-        self.board_renderer = BoardRenderer(cell_size=72)
-        self.piece_renderer = PieceRenderer(cell_size=72)
+        cell_size = _compute_cell_size()
+        self.board_renderer = BoardRenderer(cell_size=cell_size)
+        self.piece_renderer = PieceRenderer(cell_size=cell_size)
 
         window_w = self.board_renderer.total_width + SIDEBAR_WIDTH
         window_h = self.board_renderer.total_height
@@ -84,7 +138,10 @@ class JungleApp:
         self.red_captured = []
         self.ai_thinking = False
         self.ai_result = None
+        self.ai_done = threading.Event()
         self.ai_thread = None
+        self.board_flipped = False
+        self.board_renderer.set_flipped(False)
         self.tick = 0
         self.capture_animations: list[CaptureAnimation] = []
         self.last_ai_move_time = 0  # For AI-vs-AI delay
@@ -102,6 +159,9 @@ class JungleApp:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                    elif event.key == pygame.K_f:
+                        self.board_flipped = not self.board_flipped
+                        self.board_renderer.set_flipped(self.board_flipped)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self._handle_click(mouse_pos)
 
@@ -111,9 +171,10 @@ class JungleApp:
             self.capture_animations = [a for a in self.capture_animations if a.active]
 
             # Check AI result
-            if self.ai_result is not None:
+            if self.ai_done.is_set():
                 self._execute_ai_move()
                 self.ai_result = None
+                self.ai_done.clear()
                 self.ai_thinking = False
 
             # AI turn handling
@@ -142,6 +203,10 @@ class JungleApp:
             return
         if self.ui.check_ai_vs_ai_click(mouse_pos):
             self._init_game(self.MODE_AI_VS_AI)
+            return
+        if self.ui.check_flip_click(mouse_pos):
+            self.board_flipped = not self.board_flipped
+            self.board_renderer.set_flipped(self.board_flipped)
             return
 
         # Don't allow clicks during AI thinking or game over
@@ -200,6 +265,7 @@ class JungleApp:
             return
         self.ai_thinking = True
         self.ai_result = None
+        self.ai_done.clear()
 
         game_copy = self.game.copy()
         current_player = self.game.current_player
@@ -216,6 +282,8 @@ class JungleApp:
             except Exception:
                 self.ai_result = None
                 self.ai_thinking = False
+            finally:
+                self.ai_done.set()
 
         self.ai_thread = threading.Thread(target=ai_worker, daemon=True)
         self.ai_thread.start()

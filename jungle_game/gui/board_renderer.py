@@ -8,7 +8,6 @@ from jungle_game.engine.board import (
     Board, COLS, ROWS, LAND, WATER, TRAP, DEN,
     WATER_SQUARES, BLUE_DEN, RED_DEN, BLUE_TRAPS, RED_TRAPS,
 )
-from jungle_game.engine.pieces import Player
 
 
 # Colors
@@ -38,15 +37,37 @@ class BoardRenderer:
         self.border_width = 12
         self.total_width = self.board_width + 2 * self.border_width
         self.total_height = self.board_height + 2 * self.border_width
+        self.flipped = False
 
         # Pre-render the static board surface (terrain + grid)
         self._board_surface = self._render_static_board()
+        self._flipped_surface = None
         self._wave_offset = 0
+
+    def set_flipped(self, flipped: bool):
+        """Toggle board flip. When flipped, rows and columns are mirrored visually."""
+        if flipped != self.flipped:
+            self.flipped = flipped
+            self._flipped_surface = None  # Invalidate cache
+
+    def _flip_col(self, col: int) -> int:
+        """Mirror a column index when the board is flipped."""
+        if self.flipped:
+            return COLS - 1 - col
+        return col
+
+    def _flip_row(self, row: int) -> int:
+        """Mirror a row index when the board is flipped."""
+        if self.flipped:
+            return ROWS - 1 - row
+        return row
 
     def _cell_rect(self, col: int, row: int) -> pygame.Rect:
         """Get the pixel rectangle for a cell (board-local coordinates)."""
-        x = self.border_width + col * self.cell_size
-        y = self.border_width + row * self.cell_size
+        dc = self._flip_col(col)
+        dr = self._flip_row(row)
+        x = self.border_width + dc * self.cell_size
+        y = self.border_width + dr * self.cell_size
         return pygame.Rect(x, y, self.cell_size, self.cell_size)
 
     def _cell_center(self, col: int, row: int) -> tuple[int, int]:
@@ -63,10 +84,13 @@ class BoardRenderer:
         by = py - self.border_width
         if bx < 0 or by < 0:
             return None
-        col = bx // self.cell_size
-        row = by // self.cell_size
-        if 0 <= col < COLS and 0 <= row < ROWS:
-            return (col, row)
+        display_col = bx // self.cell_size
+        display_row = by // self.cell_size
+        if 0 <= display_col < COLS and 0 <= display_row < ROWS:
+            # Un-flip to get logical coordinates
+            if self.flipped:
+                return (COLS - 1 - display_col, ROWS - 1 - display_row)
+            return (display_col, display_row)
         return None
 
     def _render_static_board(self) -> pygame.Surface:
@@ -135,7 +159,13 @@ class BoardRenderer:
                last_move: tuple | None = None,
                tick: int = 0):
         """Render the board with all overlays."""
-        surface.blit(self._board_surface, offset)
+        if self.flipped:
+            if self._flipped_surface is None:
+                self._flipped_surface = pygame.transform.flip(
+                    self._board_surface, True, True)
+            surface.blit(self._flipped_surface, offset)
+        else:
+            surface.blit(self._board_surface, offset)
 
         ox, oy = offset
 

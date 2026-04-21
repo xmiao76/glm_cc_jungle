@@ -49,7 +49,6 @@ jungle_game/
 │   ├── board_renderer.py  # Terrain (water, trap, den, land), grid, highlights
 │   ├── piece_renderer.py  # Animal piece tokens (pre-rendered surfaces)
 │   ├── ui_overlay.py      # Turn indicator, captured pieces, buttons, game-over
-│   └── assets.py    # resource_path() for PyInstaller compatibility
 ├── main.py          # Entry point
 tests/               # pytest tests for engine, rules, AI
 release/             # Packaged output (jungle_game.exe + README.txt)
@@ -62,6 +61,7 @@ release/             # Packaged output (jungle_game.exe + README.txt)
 - **Capture validation**: `is_capture_valid()` takes the attacker's *original* position (not target) to correctly handle terrain context (rat in water vs land).
 - **Board coordinates**: (col, row) where col 0–6, row 0–8. Row 0 = Blue's home (top), row 8 = Red's home (bottom).
 - **River jumps**: Lion jumps vertically and horizontally; Tiger only vertically. Both blocked by any Rat in intervening water.
+- **Board flip**: Pressing `F` toggles visual flip of the board (row/col mirrored). This is display-only — it does not affect game state, turn order, or AI logic.
 
 ## Disambiguated Rules
 

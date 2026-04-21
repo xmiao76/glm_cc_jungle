@@ -203,7 +203,14 @@ class TranspositionTable:
         return None
 
     def store(self, hash_key: int, depth: int, score: int, flag: int, best_move):
-        """Store a position in the table."""
+        """Store a position in the table.
+
+        Uses depth-preferred replacement: never overwrite an existing deeper
+        entry. When the table exceeds max_size, clear it entirely (standard
+        approach in chess-like engines — cheap and avoids partial-clear overhead).
+        """
+        if len(self._table) >= self._max_size:
+            self._table.clear()
         existing = self._table.get(hash_key)
         if existing is not None and existing['depth'] > depth:
             return  # Don't overwrite deeper entries
@@ -213,12 +220,6 @@ class TranspositionTable:
             'flag': flag,
             'best_move': best_move,
         }
-        # Evict oldest entries if table is too large
-        if len(self._table) > self._max_size:
-            # Simple eviction: clear half the table
-            keys = list(self._table.keys())
-            for k in keys[:len(keys) // 2]:
-                del self._table[k]
 
     def clear(self):
         self._table.clear()
@@ -375,12 +376,12 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
     best_move = moves[0]
 
     if maximizing:
+        orig_alpha = alpha
         max_eval = -999999
         for from_pos, to_pos in moves:
             if time.time() - start_time > time_limit:
                 break
-            captured = game_state.make_move(from_pos, to_pos,
-                                           skip_validation=True)
+            game_state.make_move(from_pos, to_pos, skip_validation=True)
             eval_score = _alpha_beta(game_state, depth - 1, alpha, beta,
                                      False, player, start_time, time_limit)
             game_state.undo_move()
@@ -393,18 +394,22 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
             if beta <= alpha:
                 break
 
-        _tt.store(hash_key, depth, max_eval,
-                 EXACT if max_eval > alpha and max_eval < beta
-                 else (LOWERBOUND if max_eval >= beta else UPPERBOUND),
-                 best_move)
+        # Determine TT flag using original alpha (before search narrowed it)
+        if max_eval <= orig_alpha:
+            flag = UPPERBOUND
+        elif max_eval >= beta:
+            flag = LOWERBOUND
+        else:
+            flag = EXACT
+        _tt.store(hash_key, depth, max_eval, flag, best_move)
         return max_eval
     else:
+        orig_alpha = alpha
         min_eval = 999999
         for from_pos, to_pos in moves:
             if time.time() - start_time > time_limit:
                 break
-            captured = game_state.make_move(from_pos, to_pos,
-                                           skip_validation=True)
+            game_state.make_move(from_pos, to_pos, skip_validation=True)
             eval_score = _alpha_beta(game_state, depth - 1, alpha, beta,
                                      True, player, start_time, time_limit)
             game_state.undo_move()
@@ -417,10 +422,14 @@ def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
             if beta <= alpha:
                 break
 
-        _tt.store(hash_key, depth, min_eval,
-                 EXACT if min_eval > alpha and min_eval < beta
-                 else (LOWERBOUND if min_eval >= beta else UPPERBOUND),
-                 best_move)
+        # Determine TT flag using original alpha (before search narrowed it)
+        if min_eval <= orig_alpha:
+            flag = UPPERBOUND
+        elif min_eval >= beta:
+            flag = LOWERBOUND
+        else:
+            flag = EXACT
+        _tt.store(hash_key, depth, min_eval, flag, best_move)
         return min_eval
 
 
@@ -464,8 +473,7 @@ def find_best_move(game_state, player: Player = None,
             if time.time() - start_time > time_limit * 0.9:
                 break
 
-            captured = game_state.make_move(from_pos, to_pos,
-                                           skip_validation=True)
+            game_state.make_move(from_pos, to_pos, skip_validation=True)
             score = _alpha_beta(game_state, depth - 1, -999999, 999999,
                                 False, player, start_time,
                                 time_limit - (time.time() - start_time))

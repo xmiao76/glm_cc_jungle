@@ -58,3 +58,6 @@ use the alpha-beta search AI. This mode is useful for observing strategy.
 
 RULES REFERENCE
 Full rules: https://en.wikipedia.org/wiki/Jungle_(board_game)
+
+TECHNICAL NOTES
+This game was developed using Claude Code (claude.ai/code) powered by the GLM-5.1 model.

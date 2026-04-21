@@ -34,18 +34,6 @@ PIECE_NAMES = {
     PieceType.ELEPHANT: "Elephant",
 }
 
-# Chinese characters for pieces
-PIECE_CHINESE = {
-    PieceType.RAT: "鼠",
-    PieceType.CAT: "猫",
-    PieceType.DOG: "狗",
-    PieceType.WOLF: "狼",
-    PieceType.LEOPARD: "豹",
-    PieceType.TIGER: "虎",
-    PieceType.LION: "狮",
-    PieceType.ELEPHANT: "象",
-}
-
 
 @dataclass
 class Piece:

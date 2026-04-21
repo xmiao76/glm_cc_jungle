@@ -4,7 +4,7 @@ Renders turn indicator, captured pieces display, buttons, and game-over messages
 """
 
 import pygame
-from jungle_game.engine.pieces import Player, PIECE_CHINESE, PieceType
+from jungle_game.engine.pieces import Player, PieceType
 
 
 # Colors
@@ -59,9 +59,10 @@ class UIOverlay:
         # Buttons
         btn_x = board_width + 20
         btn_w = sidebar_width - 40
-        self.btn_new_game = Button(btn_x, board_height - 120, btn_w, 40, "New Game")
-        self.btn_ai_vs_ai = Button(btn_x, board_height - 70, btn_w, 40, "AI vs AI")
-        self.buttons = [self.btn_new_game, self.btn_ai_vs_ai]
+        self.btn_new_game = Button(btn_x, board_height - 170, btn_w, 40, "New Game")
+        self.btn_ai_vs_ai = Button(btn_x, board_height - 120, btn_w, 40, "AI vs AI")
+        self.btn_flip = Button(btn_x, board_height - 70, btn_w, 40, "Flip Board")
+        self.buttons = [self.btn_new_game, self.btn_ai_vs_ai, self.btn_flip]
 
         # Game over buttons
         self.btn_restart = Button(0, 0, 160, 44, "New Game")
@@ -164,6 +165,9 @@ class UIOverlay:
     def check_ai_vs_ai_click(self, mouse_pos: tuple[int, int]) -> bool:
         return self.btn_ai_vs_ai.is_clicked(mouse_pos) or self.btn_ai_vs_ai_restart.is_clicked(mouse_pos)
 
+    def check_flip_click(self, mouse_pos: tuple[int, int]) -> bool:
+        return self.btn_flip.is_clicked(mouse_pos)
+
     def render_rank_legend(self, surface: pygame.Surface, offset_x: int, offset_y: int):
         """Render piece rank legend on sidebar."""
         header = self.font_medium.render("Ranks:", True, COLOR_TEXT)
@@ -174,3 +178,8 @@ class UIOverlay:
             text = self.font_small.render(name, True, COLOR_TEXT)
             surface.blit(text, (offset_x + 10, y))
             y += 20
+
+        # Keyboard hint
+        y += 10
+        hint = self.font_small.render("(or press F)", True, (140, 140, 140))
+        surface.blit(hint, (offset_x + 10, y))
