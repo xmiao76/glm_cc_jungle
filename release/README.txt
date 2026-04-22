@@ -15,12 +15,14 @@ Double-click jungle_game.exe to start the game.
 
 GAMEPLAY
 You play as Blue (top of the board). The AI plays as Red (bottom).
-Blue moves first. Click one of your pieces to select it, then click a
-highlighted target square to move there.
+By default you (Human/Blue) move first. Use the "Human First/AI First" button
+to let the AI move first instead. Click one of your pieces to select it, then
+click a highlighted target square to move there.
 
 CONTROLS
 - Left click: Select piece / Move to target
 - ESC: Quit the game
+- "Human First/AI First" button: Toggle who moves first (applies to next game)
 - "New Game" button: Start a new Human vs AI game
 - "AI vs AI" button: Watch the AI play against itself
 

@@ -59,10 +59,12 @@ class UIOverlay:
         # Buttons
         btn_x = board_width + 20
         btn_w = sidebar_width - 40
+        self.btn_first_player = Button(btn_x, board_height - 220, btn_w, 40, "Human First")
         self.btn_new_game = Button(btn_x, board_height - 170, btn_w, 40, "New Game")
         self.btn_ai_vs_ai = Button(btn_x, board_height - 120, btn_w, 40, "AI vs AI")
         self.btn_flip = Button(btn_x, board_height - 70, btn_w, 40, "Flip Board")
-        self.buttons = [self.btn_new_game, self.btn_ai_vs_ai, self.btn_flip]
+        self.buttons = [self.btn_first_player, self.btn_new_game, self.btn_ai_vs_ai, self.btn_flip]
+        self._first_player = Player.BLUE
 
         # Game over buttons
         self.btn_restart = Button(0, 0, 160, 44, "New Game")
@@ -123,6 +125,11 @@ class UIOverlay:
         for btn in self.buttons:
             btn.update_hover(mouse_pos)
             btn.render(surface, self.font_medium)
+        # Color indicator on first-player button (blue=Human, red=AI)
+        color = COLOR_BLUE if self._first_player == Player.BLUE else COLOR_RED
+        cx = self.btn_first_player.rect.right - 16
+        cy = self.btn_first_player.rect.centery
+        pygame.draw.circle(surface, color, (cx, cy), 8)
 
     def render_game_over(self, surface: pygame.Surface, winner: Player,
                           mouse_pos: tuple[int, int]):
@@ -167,6 +174,14 @@ class UIOverlay:
 
     def check_flip_click(self, mouse_pos: tuple[int, int]) -> bool:
         return self.btn_flip.is_clicked(mouse_pos)
+
+    def check_first_player_click(self, mouse_pos: tuple[int, int]) -> bool:
+        return self.btn_first_player.is_clicked(mouse_pos)
+
+    def set_first_player(self, player: Player):
+        """Update the first-player toggle button text."""
+        self._first_player = player
+        self.btn_first_player.text = "Human First" if player == Player.BLUE else "AI First"
 
     def render_rank_legend(self, surface: pygame.Surface, offset_x: int, offset_y: int):
         """Render piece rank legend on sidebar."""

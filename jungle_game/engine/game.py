@@ -10,10 +10,10 @@ from jungle_game.engine.rules import generate_legal_moves, check_win
 class GameState:
     """Mutable game state. Supports make_move/undo_move and copying for AI search."""
 
-    def __init__(self):
+    def __init__(self, first_player: Player = Player.BLUE):
         self.board = Board()
         self.pieces: list[Piece] = self.board.create_pieces()
-        self.current_player = Player.BLUE  # Blue moves first
+        self.current_player = first_player
         self._pieces_by_pos: dict[tuple[int, int], Piece] = {}
         self._move_history: list[tuple] = []  # Stack for undo
         self._winner: Player | None = None

@@ -1,2 +1,8 @@
 /build
 /release/jungle_game
+*.pyc
+*.pyc
+/jungle_game/engine/__pycache__
+/tests/__pycache__
+/jungle_game/engine/__pycache__
+/tests/__pycache__

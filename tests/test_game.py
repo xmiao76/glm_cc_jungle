@@ -37,6 +37,18 @@ class TestGameStateInit:
         game = GameState()
         assert game.piece_at(3, 4) is None  # Land between rivers
 
+    def test_custom_first_player(self):
+        game = GameState(first_player=Player.RED)
+        assert game.current_player == Player.RED
+
+    def test_first_player_alternation(self):
+        """When Red moves first, after Red's move it should be Blue's turn."""
+        game = GameState(first_player=Player.RED)
+        assert game.current_player == Player.RED
+        moves = game.get_legal_moves()
+        game.make_move(moves[0][0], moves[0][1])
+        assert game.current_player == Player.BLUE
+
 
 class TestMakeMove:
     def test_valid_move(self):

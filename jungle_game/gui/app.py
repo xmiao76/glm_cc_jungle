@@ -121,6 +121,7 @@ class JungleApp:
         self.ui = UIOverlay(self.board_renderer.total_width,
                             self.board_renderer.total_height, SIDEBAR_WIDTH)
 
+        self.first_player = Player.BLUE
         self._init_game()
 
     def _init_game(self, mode: int = None):
@@ -130,7 +131,7 @@ class JungleApp:
         else:
             self.mode = self.MODE_HUMAN_VS_AI
         clear_tt()  # Reset transposition table for new game
-        self.game = GameState()
+        self.game = GameState(first_player=self.first_player)
         self.selected_pos = None
         self.legal_moves_for_selected = []
         self.last_move = None
@@ -208,6 +209,9 @@ class JungleApp:
             self.board_flipped = not self.board_flipped
             self.board_renderer.set_flipped(self.board_flipped)
             return
+        if self.ui.check_first_player_click(mouse_pos):
+            self._toggle_first_player()
+            return
 
         # Don't allow clicks during AI thinking or game over
         if self.ai_thinking or self.game.is_over:
@@ -258,6 +262,14 @@ class JungleApp:
             self.selected_pos = (col, row)
             all_moves = generate_legal_moves(self.game, self.game.current_player)
             self.legal_moves_for_selected = [m for m in all_moves if m[0] == (col, row)]
+
+    def _toggle_first_player(self):
+        """Toggle whether Human or AI moves first (applies to the next new game)."""
+        if self.first_player == Player.BLUE:
+            self.first_player = Player.RED
+        else:
+            self.first_player = Player.BLUE
+        self.ui.set_first_player(self.first_player)
 
     def _start_ai_turn(self):
         """Start AI thinking in a background thread."""
