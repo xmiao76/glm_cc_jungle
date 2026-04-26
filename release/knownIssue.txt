@@ -1,0 +1,1 @@
+1.Why can’t my piece capture my opponent’s lower-ranked pieces when they are in their own trap?
