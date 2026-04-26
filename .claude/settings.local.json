@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p \"c:/GitHub/glm_cc_jungle/.claude/PRPs/plans/completed\")",
+      "Bash(mv \"c:/GitHub/glm_cc_jungle/.claude/PRPs/plans/review-improve-enhance-ai.plan.md\" \"c:/GitHub/glm_cc_jungle/.claude/PRPs/plans/completed/\")"
+    ]
+  }
+}
