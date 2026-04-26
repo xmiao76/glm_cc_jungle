@@ -242,22 +242,31 @@ def check_win(game_state) -> Player | None:
 
     Returns the winning player, or None if no winner yet.
     """
+    winner, _ = check_win_with_reason(game_state)
+    return winner
+
+
+def check_win_with_reason(game_state) -> tuple[Player | None, str]:
+    """Check if the game has been won, returning (winner, reason).
+
+    Reason is one of: "den_entry", "elimination", "stalemate", or "" if no winner.
+    """
     board = game_state.board
     pieces_by_pos = game_state.pieces_by_pos
 
     # Check den entry: if any piece is on the opponent's den
     for pos, piece in pieces_by_pos.items():
         if board.is_opponent_den(piece.col, piece.row, piece.player):
-            return piece.player
+            return piece.player, "den_entry"
 
     # Check elimination: if one player has no pieces
     blue_pieces = game_state.get_player_pieces(Player.BLUE)
     red_pieces = game_state.get_player_pieces(Player.RED)
 
     if len(blue_pieces) == 0:
-        return Player.RED
+        return Player.RED, "elimination"
     if len(red_pieces) == 0:
-        return Player.BLUE
+        return Player.BLUE, "elimination"
 
     # Check stalemate: if current player has no legal moves
     current = game_state.current_player
@@ -265,7 +274,7 @@ def check_win(game_state) -> Player | None:
     if len(legal_moves) == 0:
         # Current player loses
         if current == Player.BLUE:
-            return Player.RED
-        return Player.BLUE
+            return Player.RED, "stalemate"
+        return Player.BLUE, "stalemate"
 
-    return None
+    return None, ""

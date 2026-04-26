@@ -4,6 +4,7 @@ Draws terrain tiles (land, water, trap, den), grid lines, and highlights.
 """
 
 import pygame
+import math
 from jungle_game.engine.board import (
     Board, COLS, ROWS, LAND, WATER, TRAP, DEN,
     WATER_SQUARES, BLUE_DEN, RED_DEN, BLUE_TRAPS, RED_TRAPS,
@@ -15,14 +16,18 @@ COLOR_LAND = (139, 195, 74)         # Soft green
 COLOR_LAND_ALT = (124, 179, 66)     # Slightly darker green for checkerboard
 COLOR_WATER = (66, 165, 245)        # Blue
 COLOR_WATER_ALT = (41, 150, 243)    # Darker blue for wave effect
-COLOR_TRAP = (120, 120, 120)        # Dark gray/stone
+COLOR_TRAP_BLUE = (170, 175, 210)   # Blue-tinted gray for Blue's traps
+COLOR_TRAP_RED = (210, 175, 175)    # Red-tinted gray for Red's traps
 COLOR_TRAP_MARKER = (180, 180, 180) # Lighter gray for X
-COLOR_DEN_BLUE = (255, 215, 0)      # Gold
-COLOR_DEN_RED = (255, 215, 0)       # Gold
+COLOR_DEN_BLUE = (200, 210, 255)     # Blue-tinted for Blue's den
+COLOR_DEN_RED = (255, 200, 200)     # Red-tinted for Red's den
 COLOR_GRID = (60, 60, 60)          # Dark grid lines
-COLOR_BOARD_BORDER = (101, 67, 33)  # Wood brown
+COLOR_BORDER_OUTER = (70, 45, 20)   # Dark wood outer
+COLOR_BORDER_MID = (101, 67, 33)   # Medium wood
+COLOR_BORDER_INNER = (140, 100, 55) # Light wood highlight
 COLOR_SELECTED = (255, 235, 59)     # Yellow glow
 COLOR_LEGAL_MOVE = (76, 175, 80, 140)  # Semi-transparent green
+COLOR_CAPTURE_MOVE = (220, 50, 50, 180) # Semi-transparent red for captures
 COLOR_LAST_MOVE = (255, 255, 0, 60)   # Subtle yellow highlight
 
 
@@ -97,8 +102,15 @@ class BoardRenderer:
         """Pre-render the static board (terrain + grid + border)."""
         surface = pygame.Surface((self.total_width, self.total_height))
 
-        # Border (wooden frame)
-        surface.fill(COLOR_BOARD_BORDER)
+        # Beveled wooden border
+        surface.fill(COLOR_BORDER_OUTER)
+        bw = self.border_width
+        pygame.draw.rect(surface, COLOR_BORDER_MID, (2, 2, self.total_width - 4, self.total_height - 4))
+        pygame.draw.rect(surface, COLOR_BORDER_INNER, (4, 4, self.total_width - 8, self.total_height - 8))
+        pygame.draw.rect(surface, COLOR_BORDER_MID, (6, 6, self.total_width - 12, self.total_height - 12))
+        # Inner shadow line just inside the board edge
+        pygame.draw.rect(surface, COLOR_BORDER_OUTER,
+                         (bw - 1, bw - 1, self.board_width + 2, self.board_height + 2), 1)
 
         # Draw terrain tiles
         for row in range(ROWS):
@@ -107,11 +119,16 @@ class BoardRenderer:
                 terrain = self.board.terrain_at(col, row)
 
                 if terrain == WATER:
-                    # Water squares get animated separately, use base color
                     color = COLOR_WATER if (row + col) % 2 == 0 else COLOR_WATER_ALT
                     pygame.draw.rect(surface, color, rect)
                 elif terrain == TRAP:
-                    pygame.draw.rect(surface, COLOR_TRAP, rect)
+                    if (col, row) in BLUE_TRAPS:
+                        trap_color = COLOR_TRAP_BLUE
+                        label_color = (100, 130, 220)
+                    else:
+                        trap_color = COLOR_TRAP_RED
+                        label_color = (220, 100, 100)
+                    pygame.draw.rect(surface, trap_color, rect)
                     # Draw X marker
                     cx, cy = rect.centerx, rect.centery
                     s = self.cell_size // 4
@@ -119,12 +136,21 @@ class BoardRenderer:
                                      (cx - s, cy - s), (cx + s, cy + s), 2)
                     pygame.draw.line(surface, COLOR_TRAP_MARKER,
                                      (cx + s, cy - s), (cx - s, cy + s), 2)
+                    # Small player-colored dot in corner
+                    dot_r = max(3, self.cell_size // 12)
+                    pygame.draw.circle(surface, label_color,
+                                       (rect.right - dot_r - 3, rect.top + dot_r + 3), dot_r)
                 elif terrain == DEN:
-                    pygame.draw.rect(surface, COLOR_DEN_BLUE, rect)
+                    if (col, row) == BLUE_DEN:
+                        den_color = COLOR_DEN_BLUE
+                        label, label_color = "B", (66, 133, 244)
+                    else:
+                        den_color = COLOR_DEN_RED
+                        label, label_color = "R", (229, 57, 53)
+                    pygame.draw.rect(surface, den_color, rect)
                     # Draw star marker
                     cx, cy = rect.centerx, rect.centery
                     s = self.cell_size // 4
-                    # Simple 4-point star
                     points = [
                         (cx, cy - s), (cx + s // 3, cy - s // 3),
                         (cx + s, cy), (cx + s // 3, cy + s // 3),
@@ -133,6 +159,14 @@ class BoardRenderer:
                     ]
                     pygame.draw.polygon(surface, (200, 160, 0), points)
                     pygame.draw.polygon(surface, (160, 120, 0), points, 2)
+                    # Player letter in corner
+                    try:
+                        font = pygame.font.SysFont("arial", max(10, self.cell_size // 6), bold=True)
+                    except Exception:
+                        font = pygame.font.Font(None, max(12, self.cell_size // 6))
+                    label_surf = font.render(label, True, label_color)
+                    label_rect = label_surf.get_rect(topright=(rect.right - 4, rect.top + 2))
+                    surface.blit(label_surf, label_rect)
                 else:
                     # Land
                     checker = (row + col) % 2 == 0
@@ -156,6 +190,7 @@ class BoardRenderer:
     def render(self, surface: pygame.Surface, offset: tuple[int, int],
                selected_pos: tuple[int, int] | None = None,
                legal_moves: list | None = None,
+               capture_targets: set | None = None,
                last_move: tuple | None = None,
                tick: int = 0):
         """Render the board with all overlays."""
@@ -192,31 +227,42 @@ class BoardRenderer:
 
         # Legal move indicators
         if legal_moves:
+            capture_set = capture_targets or set()
             for from_pos, to_pos in legal_moves:
                 cx, cy = self._cell_center(to_pos[0], to_pos[1])
                 cx += ox
                 cy += oy
-                # Draw a semi-transparent green dot
                 dot_surface = pygame.Surface((self.cell_size, self.cell_size), pygame.SRCALPHA)
-                radius = self.cell_size // 6
-                pygame.draw.circle(dot_surface, COLOR_LEGAL_MOVE,
-                                   (self.cell_size // 2, self.cell_size // 2), radius)
+                if to_pos in capture_set:
+                    # Red ring for capture moves
+                    radius = self.cell_size // 3
+                    pygame.draw.circle(dot_surface, COLOR_CAPTURE_MOVE,
+                                       (self.cell_size // 2, self.cell_size // 2), radius, 3)
+                else:
+                    # Green dot for normal moves
+                    radius = self.cell_size // 6
+                    pygame.draw.circle(dot_surface, COLOR_LEGAL_MOVE,
+                                       (self.cell_size // 2, self.cell_size // 2), radius)
                 surface.blit(dot_surface,
                              (cx - self.cell_size // 2, cy - self.cell_size // 2))
 
     def _render_water_animation(self, surface: pygame.Surface, ox: int, oy: int, tick: int):
-        """Subtle wave animation on water squares."""
-        self._wave_offset = (tick // 15) % 2  # Toggle every 15 ticks
+        """Multi-wave animation on water squares."""
+        self._wave_offset = (tick // 15) % 2
         for col, row in WATER_SQUARES:
             rect = self._cell_rect(col, row)
             rect.x += ox
             rect.y += oy
-            # Alternate between two shades for wave effect
             if (row + col + self._wave_offset) % 2 == 0:
                 pygame.draw.rect(surface, COLOR_WATER, rect)
             else:
                 pygame.draw.rect(surface, COLOR_WATER_ALT, rect)
-            # Subtle wave line
-            wave_y = rect.y + rect.height // 2 + (2 if self._wave_offset else -2)
-            pygame.draw.line(surface, (100, 190, 255),
-                             (rect.x + 4, wave_y), (rect.x + rect.width - 4, wave_y), 1)
+            # Multiple wavy lines using sine offsets
+            wave_color = (100, 190, 255, 120)
+            for i, y_frac in enumerate([0.25, 0.5, 0.75]):
+                wave_y = rect.y + int(rect.height * y_frac)
+                phase = (tick * 0.08 + col * 0.5 + i * 1.2)
+                offset_x = int(math.sin(phase) * 3)
+                wave_surf = pygame.Surface((rect.width - 8, 2), pygame.SRCALPHA)
+                pygame.draw.line(wave_surf, wave_color, (0, 0), (rect.width - 8, 0), 1)
+                surface.blit(wave_surf, (rect.x + 4 + offset_x, wave_y))

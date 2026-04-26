@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 from jungle_game.engine.board import Board
 from jungle_game.engine.pieces import Piece, PieceType, Player
-from jungle_game.engine.rules import generate_legal_moves, check_win
+from jungle_game.engine.rules import generate_legal_moves, check_win, check_win_with_reason
 
 
 class GameState:
@@ -17,6 +17,7 @@ class GameState:
         self._pieces_by_pos: dict[tuple[int, int], Piece] = {}
         self._move_history: list[tuple] = []  # Stack for undo
         self._winner: Player | None = None
+        self._win_reason: str = ""
         self._rebuild_index()
 
     def _rebuild_index(self):
@@ -40,6 +41,10 @@ class GameState:
     @property
     def winner(self) -> Player | None:
         return self._winner
+
+    @property
+    def win_reason(self) -> str:
+        return self._win_reason
 
     @property
     def is_over(self) -> bool:
@@ -89,7 +94,7 @@ class GameState:
         self.current_player = Player.RED if self.current_player == Player.BLUE else Player.BLUE
 
         # Check win
-        self._winner = check_win(self)
+        self._winner, self._win_reason = check_win_with_reason(self)
 
         return captured
 
@@ -123,6 +128,7 @@ class GameState:
 
         # Clear winner (move was undone)
         self._winner = None
+        self._win_reason = ""
 
         return True
 
@@ -134,6 +140,7 @@ class GameState:
         new_state.current_player = self.current_player
         new_state._move_history = []  # Don't copy history for search states
         new_state._winner = self._winner
+        new_state._win_reason = self._win_reason
         new_state._rebuild_index()
         return new_state
 
