@@ -4,19 +4,8 @@ import pytest
 from jungle_game.engine.game import GameState
 from jungle_game.engine.board import Board, WATER_SQUARES, BLUE_DEN, RED_DEN, BLUE_TRAPS, RED_TRAPS
 from jungle_game.engine.pieces import Piece, PieceType, Player
-from jungle_game.engine.rules import generate_legal_moves, is_capture_valid, check_win
-
-
-def make_game_with_pieces(pieces: list[Piece]) -> GameState:
-    """Create a GameState with custom piece placement for testing."""
-    game = GameState.__new__(GameState)
-    game.board = Board()
-    game.pieces = pieces
-    game.current_player = Player.BLUE
-    game._move_history = []
-    game._winner = None
-    game._rebuild_index()
-    return game
+from jungle_game.engine.rules import generate_legal_moves, is_capture_valid, check_win, check_win_with_reason
+from conftest import make_game_with_pieces
 
 
 class TestBasicMovement:
@@ -339,3 +328,63 @@ class TestWinConditions:
         game = make_game_with_pieces([rat, wolf1, wolf2, wolf3, wolf4])
         winner = check_win(game)
         assert winner == Player.RED  # Blue has no legal moves
+
+
+class TestWinReason:
+    """Tests for check_win_with_reason function."""
+
+    def test_win_reason_no_winner_yet(self):
+        lion = Piece(PieceType.LION, Player.BLUE, 0, 0)
+        cat = Piece(PieceType.CAT, Player.RED, 6, 8)
+        game = make_game_with_pieces([lion, cat])
+        winner, reason = check_win_with_reason(game)
+        assert winner is None
+        assert reason == ""
+
+    def test_win_reason_den_entry(self):
+        lion = Piece(PieceType.LION, Player.BLUE, 3, 8)
+        cat = Piece(PieceType.CAT, Player.RED, 6, 8)
+        game = make_game_with_pieces([lion, cat])
+        # Lion is ON Red's den at (3,8)
+        winner, reason = check_win_with_reason(game)
+        assert winner == Player.BLUE
+        assert reason == "den_entry"
+
+    def test_win_reason_stalemate(self):
+        rat = Piece(PieceType.RAT, Player.BLUE, 3, 4)
+        wolf1 = Piece(PieceType.WOLF, Player.RED, 2, 4)
+        wolf2 = Piece(PieceType.WOLF, Player.RED, 4, 4)
+        wolf3 = Piece(PieceType.WOLF, Player.RED, 3, 3)
+        wolf4 = Piece(PieceType.WOLF, Player.RED, 3, 5)
+        game = make_game_with_pieces([rat, wolf1, wolf2, wolf3, wolf4])
+        winner, reason = check_win_with_reason(game)
+        assert winner == Player.RED
+        assert reason == "stalemate"
+
+    def test_win_reason_elimination(self):
+        lion = Piece(PieceType.LION, Player.BLUE, 3, 4)
+        game = make_game_with_pieces([lion])  # Red has no pieces
+        winner, reason = check_win_with_reason(game)
+        assert winner == Player.BLUE
+        assert reason == "elimination"
+
+
+class TestPieceHashEquality:
+    """Tests for Piece.__hash__ and __eq__ edge cases."""
+
+    def test_hash_consistency(self):
+        from jungle_game.engine.pieces import Piece, PieceType, Player
+        p1 = Piece(PieceType.LION, Player.BLUE, 0, 0)
+        p2 = Piece(PieceType.LION, Player.BLUE, 0, 0)
+        assert hash(p1) == hash(p2)
+
+    def test_hash_differs_for_different_pos(self):
+        from jungle_game.engine.pieces import Piece, PieceType, Player
+        p1 = Piece(PieceType.LION, Player.BLUE, 0, 0)
+        p2 = Piece(PieceType.LION, Player.BLUE, 1, 0)
+        assert hash(p1) != hash(p2)
+
+    def test_eq_not_implemented_for_other_type(self):
+        from jungle_game.engine.pieces import Piece, PieceType, Player
+        p = Piece(PieceType.LION, Player.BLUE, 0, 0)
+        assert p.__eq__("not a piece") is NotImplemented

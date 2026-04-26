@@ -40,11 +40,11 @@ PIECE_DISPLAY_NAMES = {
     PieceType.RAT: "Rat",
     PieceType.CAT: "Cat",
     PieceType.DOG: "Dog",
-    PieceType.WOLF: "Wolf",
-    PieceType.LEOPARD: "Leo",
-    PieceType.TIGER: "Tiger",
-    PieceType.LION: "Lion",
-    PieceType.ELEPHANT: "Eleph",
+    PieceType.WOLF: "Wlf",
+    PieceType.LEOPARD: "Lpd",
+    PieceType.TIGER: "Tgr",
+    PieceType.LION: "Lio",
+    PieceType.ELEPHANT: "Elt",
 }
 
 
@@ -478,11 +478,22 @@ class PieceRenderer:
         return self._surfaces[(piece_type, player)]
 
     def render_piece(self, surface: pygame.Surface, piece: Piece,
-                     cx: int, cy: int, selected: bool = False):
+                     cx: int, cy: int, selected: bool = False,
+                     trapped: bool = False):
         """Draw a piece centered at (cx, cy) on the target surface."""
         piece_surf = self.get_surface(piece.piece_type, piece.player, selected)
         rect = piece_surf.get_rect(center=(cx, cy))
         surface.blit(piece_surf, rect)
+        # Draw trapped indicator: red ring + dim overlay
+        if trapped:
+            r = self.piece_radius
+            trapped_surf = pygame.Surface((r * 2 + 6, r * 2 + 6), pygame.SRCALPHA)
+            tc = r + 3
+            # Red ring
+            pygame.draw.circle(trapped_surf, (255, 50, 50, 160), (tc, tc), r + 2, 3)
+            # Semi-transparent dim
+            pygame.draw.circle(trapped_surf, (0, 0, 0, 60), (tc, tc), r)
+            surface.blit(trapped_surf, (cx - tc, cy - tc))
 
     def render_captured(self, surface: pygame.Surface, piece: Piece,
                         x: int, y: int, scale: float = 0.5):

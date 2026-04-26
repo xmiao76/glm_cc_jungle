@@ -131,8 +131,14 @@ class UIOverlay:
         cy = self.btn_first_player.rect.centery
         pygame.draw.circle(surface, color, (cx, cy), 8)
 
+    WIN_REASON_LABELS = {
+        "den_entry": "Den Entry",
+        "elimination": "All Pieces Captured",
+        "stalemate": "Opponent Stalemate",
+    }
+
     def render_game_over(self, surface: pygame.Surface, winner: Player,
-                          mouse_pos: tuple[int, int]):
+                          mouse_pos: tuple[int, int], win_reason: str = ""):
         """Render game-over overlay."""
         # Semi-transparent overlay
         overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
@@ -148,12 +154,19 @@ class UIOverlay:
             color = COLOR_RED
 
         text_surf = self.font_large.render(text, True, color)
-        text_rect = text_surf.get_rect(center=(self.board_width // 2, self.board_height // 2 - 40))
+        text_rect = text_surf.get_rect(center=(self.board_width // 2, self.board_height // 2 - 50))
         surface.blit(text_surf, text_rect)
+
+        # Win reason
+        reason_label = self.WIN_REASON_LABELS.get(win_reason, "")
+        if reason_label:
+            reason_surf = self.font_medium.render(reason_label, True, COLOR_GOLD)
+            reason_rect = reason_surf.get_rect(center=(self.board_width // 2, self.board_height // 2 - 10))
+            surface.blit(reason_surf, reason_rect)
 
         # Subtitle
         sub = self.font_medium.render("Game Over", True, COLOR_TEXT)
-        sub_rect = sub.get_rect(center=(self.board_width // 2, self.board_height // 2))
+        sub_rect = sub.get_rect(center=(self.board_width // 2, self.board_height // 2 + 20))
         surface.blit(sub, sub_rect)
 
         # Buttons

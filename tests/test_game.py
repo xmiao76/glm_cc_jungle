@@ -3,6 +3,7 @@
 import pytest
 from jungle_game.engine.game import GameState
 from jungle_game.engine.pieces import Piece, PieceType, Player
+from conftest import make_game_with_pieces
 
 
 class TestGameStateInit:
@@ -168,8 +169,17 @@ class TestUndoMove:
         moves = game.get_legal_moves()
         initial_player = game.current_player
 
+        # Make 3 consecutive moves
         game.make_move(moves[0][0], moves[0][1])
-        game.undo_move()
+        moves2 = game.get_legal_moves()
+        game.make_move(moves2[0][0], moves2[0][1])
+        moves3 = game.get_legal_moves()
+        game.make_move(moves3[0][0], moves3[0][1])
+
+        # Undo all 3
+        assert game.undo_move() is True
+        assert game.undo_move() is True
+        assert game.undo_move() is True
         assert game.current_player == initial_player
 
 
@@ -262,3 +272,39 @@ class TestFullGame:
         game.make_move((3, 7), (3, 8))
         assert game.is_over
         assert game.winner == Player.BLUE
+
+    def test_undo_winning_move_clears_winner(self):
+        """Undoing a winning move should clear the winner."""
+        lion = Piece(PieceType.LION, Player.BLUE, 3, 7)
+        game = make_game_with_pieces([lion])
+        game.make_move((3, 7), (3, 8))
+        assert game.is_over
+        assert game.winner == Player.BLUE
+        game.undo_move()
+        assert not game.is_over
+        assert game.winner is None
+
+    def test_win_reason_den_entry(self):
+        """Win by den entry should have correct reason."""
+        lion = Piece(PieceType.LION, Player.BLUE, 3, 7)
+        game = make_game_with_pieces([lion])
+        game.make_move((3, 7), (3, 8))
+        assert game.win_reason == "den_entry"
+
+    def test_win_reason_elimination(self):
+        """Win by elimination should have correct reason."""
+        lion = Piece(PieceType.LION, Player.BLUE, 0, 7)
+        cat = Piece(PieceType.CAT, Player.RED, 0, 8)
+        game = make_game_with_pieces([lion, cat])
+        game.make_move((0, 7), (0, 8))
+        assert game.winner == Player.BLUE
+        assert game.win_reason == "elimination"
+
+    def test_copy_preserves_win_reason(self):
+        """Copy should preserve win reason."""
+        lion = Piece(PieceType.LION, Player.BLUE, 3, 7)
+        game = make_game_with_pieces([lion])
+        game.make_move((3, 7), (3, 8))
+        copy = game.copy()
+        assert copy.win_reason == "den_entry"
+        assert copy.winner == Player.BLUE

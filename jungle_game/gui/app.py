@@ -10,7 +10,7 @@ from jungle_game.engine.game import GameState
 from jungle_game.engine.pieces import Player
 from jungle_game.engine.ai import find_best_move, clear_tt
 from jungle_game.engine.rules import generate_legal_moves
-from jungle_game.engine.board import COLS, ROWS
+from jungle_game.engine.board import COLS, ROWS, BLUE_TRAPS, RED_TRAPS
 from jungle_game.gui.board_renderer import BoardRenderer
 from jungle_game.gui.piece_renderer import PieceRenderer
 from jungle_game.gui.ui_overlay import UIOverlay
@@ -124,6 +124,11 @@ class JungleApp:
         self.first_player = Player.BLUE
         self._init_game()
 
+    @property
+    def human_player(self) -> Player:
+        """The player controlled by the human in HUMAN_VS_AI mode."""
+        return Player.RED if self.first_player == Player.RED else Player.BLUE
+
     def _init_game(self, mode: int = None):
         """Initialize or reset the game state."""
         if mode is not None:
@@ -186,7 +191,7 @@ class JungleApp:
                     if now - self.last_ai_move_time > AI_VS_AI_DELAY_MS:
                         self._start_ai_turn()
                         self.last_ai_move_time = now
-                elif self.mode == self.MODE_HUMAN_VS_AI and self.game.current_player == Player.RED:
+                elif self.mode == self.MODE_HUMAN_VS_AI and self.game.current_player != self.human_player:
                     self._start_ai_turn()
 
             # Render
@@ -218,7 +223,7 @@ class JungleApp:
             return
 
         # Only allow clicks during human's turn in HUMAN_VS_AI mode
-        if self.mode == self.MODE_HUMAN_VS_AI and self.game.current_player == Player.RED:
+        if self.mode == self.MODE_HUMAN_VS_AI and self.game.current_player != self.human_player:
             return
 
         # Convert pixel to board coordinates
@@ -293,7 +298,6 @@ class JungleApp:
                 self.ai_result = result
             except Exception:
                 self.ai_result = None
-                self.ai_thinking = False
             finally:
                 self.ai_done.set()
 
@@ -330,10 +334,17 @@ class JungleApp:
 
         # Board
         board_offset = (0, 0)
+        capture_targets = None
+        if self.selected_pos and self.legal_moves_for_selected:
+            capture_targets = set()
+            for _, to_pos in self.legal_moves_for_selected:
+                if self.game.piece_at(to_pos[0], to_pos[1]) is not None:
+                    capture_targets.add(to_pos)
         self.board_renderer.render(
             self.screen, board_offset,
             selected_pos=self.selected_pos,
             legal_moves=self.legal_moves_for_selected if self.selected_pos else None,
+            capture_targets=capture_targets,
             last_move=self.last_move,
             tick=self.tick
         )
@@ -342,7 +353,12 @@ class JungleApp:
         for piece in self.game.pieces:
             cx, cy = self.board_renderer.board_to_pixel(piece.col, piece.row)
             is_selected = (self.selected_pos == (piece.col, piece.row))
-            self.piece_renderer.render_piece(self.screen, piece, cx, cy, is_selected)
+            # A piece is trapped if it's in the opponent's trap
+            if piece.player == Player.BLUE:
+                is_trapped = (piece.col, piece.row) in RED_TRAPS
+            else:
+                is_trapped = (piece.col, piece.row) in BLUE_TRAPS
+            self.piece_renderer.render_piece(self.screen, piece, cx, cy, is_selected, is_trapped)
 
         # Capture animations
         for anim in self.capture_animations:
@@ -365,7 +381,10 @@ class JungleApp:
             # If hovering over own piece, show cursor as selectable
             piece = self.game.piece_at(board_pos[0], board_pos[1])
             if piece is not None and piece.player == self.game.current_player:
-                pygame.draw.rect(self.screen, (255, 255, 255, 50), rect, 2)
+                hover_border = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+                pygame.draw.rect(hover_border, (255, 255, 255, 50),
+                                 (0, 0, rect.width, rect.height), 2)
+                self.screen.blit(hover_border, rect)
 
         # Turn indicator
         self.ui.render_turn_indicator(
@@ -393,6 +412,7 @@ class JungleApp:
 
         # Game over overlay
         if self.game.is_over:
-            self.ui.render_game_over(self.screen, self.game.winner, mouse_pos)
+            self.ui.render_game_over(self.screen, self.game.winner, mouse_pos,
+                                      self.game.win_reason)
 
         pygame.display.flip()
