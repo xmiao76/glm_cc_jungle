@@ -4,7 +4,10 @@ from __future__ import annotations
 import copy
 from jungle_game.engine.board import Board
 from jungle_game.engine.pieces import Piece, PieceType, Player
-from jungle_game.engine.rules import generate_legal_moves, check_win, check_win_with_reason
+from jungle_game.engine.rules import (
+    generate_legal_moves, check_win, check_win_with_reason, check_win_fast,
+)
+from jungle_game.engine.zobrist import initial_hash, piece_key, ZOBRIST_SIDE
 
 
 class GameState:
@@ -18,13 +21,20 @@ class GameState:
         self._move_history: list[tuple] = []  # Stack for undo
         self._winner: Player | None = None
         self._win_reason: str = ""
+        self._zobrist: int = 0
         self._rebuild_index()
 
     def _rebuild_index(self):
-        """Rebuild the position -> piece index."""
+        """Rebuild the position -> piece index and the incremental Zobrist hash."""
         self._pieces_by_pos = {}
         for p in self.pieces:
             self._pieces_by_pos[(p.col, p.row)] = p
+        self._zobrist = initial_hash(self.pieces, self.current_player)
+
+    @property
+    def zobrist_hash(self) -> int:
+        """The current position's Zobrist hash, maintained incrementally."""
+        return self._zobrist
 
     @property
     def pieces_by_pos(self) -> dict[tuple[int, int], Piece]:
@@ -51,7 +61,7 @@ class GameState:
         return self._winner is not None
 
     def make_move(self, from_pos: tuple[int, int], to_pos: tuple[int, int],
-                  skip_validation: bool = False):
+                  skip_validation: bool = False) -> Piece | None:
         """Execute a move. Returns the captured piece if any, or None.
 
         Args:
@@ -77,8 +87,19 @@ class GameState:
 
         captured = self._pieces_by_pos.get(to_pos)
 
-        # Save state for undo
-        self._move_history.append((from_pos, to_pos, piece.copy(), captured.copy() if captured else None))
+        # Save state for undo (including the pre-move hash for fast undo).
+        prev_hash = self._zobrist
+        self._move_history.append((from_pos, to_pos, piece.copy(),
+                                    captured.copy() if captured else None, prev_hash))
+
+        # Update the incremental Zobrist hash: remove the mover from its old
+        # square, remove any captured piece, add the mover at its new square,
+        # then flip the side-to-move key. Keys are read BEFORE mutating the
+        # moving piece's position.
+        h = self._zobrist
+        h ^= piece_key(piece)
+        if captured is not None:
+            h ^= piece_key(captured)
 
         # Remove captured piece
         if captured is not None:
@@ -89,12 +110,19 @@ class GameState:
         del self._pieces_by_pos[from_pos]
         piece.col, piece.row = to_pos
         self._pieces_by_pos[to_pos] = piece
+        h ^= piece_key(piece)        # mover now at its new square
+        h ^= ZOBRIST_SIDE             # side to move flips
+        self._zobrist = h
 
         # Switch player
         self.current_player = Player.RED if self.current_player == Player.BLUE else Player.BLUE
 
-        # Check win
-        self._winner, self._win_reason = check_win_with_reason(self)
+        # Check win. The search path (skip_validation) uses the short-circuiting
+        # fast check; the GUI path uses the full check (stable win_reason text).
+        if skip_validation:
+            self._winner, self._win_reason = check_win_fast(self)
+        else:
+            self._winner, self._win_reason = check_win_with_reason(self)
 
         return captured
 
@@ -103,7 +131,7 @@ class GameState:
         if not self._move_history:
             return False
 
-        from_pos, to_pos, original_piece, captured_piece = self._move_history.pop()
+        from_pos, to_pos, original_piece, captured_piece, prev_hash = self._move_history.pop()
 
         # Find the piece that was moved (it's now at to_pos)
         moved_piece = self._pieces_by_pos.get(to_pos)
@@ -126,6 +154,9 @@ class GameState:
         # Switch back to the previous player
         self.current_player = Player.RED if self.current_player == Player.BLUE else Player.BLUE
 
+        # Restore the pre-move Zobrist hash (captured before any mutation).
+        self._zobrist = prev_hash
+
         # Clear winner (move was undone)
         self._winner = None
         self._win_reason = ""
@@ -141,7 +172,7 @@ class GameState:
         new_state._move_history = []  # Don't copy history for search states
         new_state._winner = self._winner
         new_state._win_reason = self._win_reason
-        new_state._rebuild_index()
+        new_state._rebuild_index()  # also recomputes _zobrist from the copied pieces
         return new_state
 
     def get_legal_moves(self) -> list[tuple[tuple[int, int], tuple[int, int]]]:

@@ -63,8 +63,11 @@ def is_capture_valid(
 
     # Determine effective ranks (trap effects)
     defender_rank = _effective_rank(defender, board)
-    # Attacker rank at destination (where the capture occurs)
-    if board.is_opponent_trap(defender.col, defender.row, attacker_player):
+    # Attacker rank at its CURRENT (pre-move) position. A piece currently in the
+    # opponent's trap is rank 0; entering the opponent's trap to capture does NOT
+    # reduce the attacker's rank for that capture, so a higher-rank piece can
+    # capture a lower-rank piece sitting in the defender's own trap.
+    if board.is_opponent_trap(attacker_col, attacker_row, attacker_player):
         attacker_rank = 0
     else:
         attacker_rank = int(attacker_type)
@@ -244,6 +247,80 @@ def check_win(game_state) -> Player | None:
     """
     winner, _ = check_win_with_reason(game_state)
     return winner
+
+
+def has_any_legal_move(game_state, player: Player) -> bool:
+    """Return True as soon as any legal move exists for ``player`` (short-circuit).
+
+    Mirrors :func:`generate_legal_moves` exactly but stops at the first legal
+    move found. Used by :func:`check_win_fast` for cheap stalemate detection:
+    ~99% of positions have a legal move on the first piece's first direction, so
+    this returns almost instantly instead of building the full move list.
+    """
+    board = game_state.board
+    pieces_by_pos = game_state.pieces_by_pos
+
+    for piece in game_state.get_player_pieces(player):
+        for dc, dr in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            nc, nr = piece.col + dc, piece.row + dr
+            if not board.in_bounds(nc, nr):
+                continue
+            if board.is_own_den(nc, nr, piece.player):
+                continue
+            if board.is_water(nc, nr) and not piece.can_enter_water():
+                # Lion/Tiger: a legal river jump also counts as "has a move".
+                if piece.can_jump_river():
+                    jump_landing = _get_river_jump_landing(piece, dc, dr, board)
+                    if jump_landing is not None and not _is_river_jump_blocked(
+                            piece, dc, dr, board, pieces_by_pos):
+                        jc, jr = jump_landing
+                        if not board.is_own_den(jc, jr, piece.player):
+                            target = pieces_by_pos.get((jc, jr))
+                            if (target is None
+                                    or (target.player != piece.player
+                                        and is_capture_valid(piece.piece_type,
+                                            piece.player, piece.col, piece.row,
+                                            target, board))):
+                                return True
+                continue
+            target = pieces_by_pos.get((nc, nr))
+            if target is None:
+                return True   # empty square = a legal move
+            if target.player != piece.player and is_capture_valid(
+                    piece.piece_type, piece.player, piece.col, piece.row,
+                    target, board):
+                return True
+    return False
+
+
+def check_win_fast(game_state) -> tuple[Player | None, str]:
+    """Cheap terminal check for the search path (``make_move(skip_validation=True)``).
+
+    Detects den-entry and elimination in a single pass, and stalemate via the
+    short-circuiting :func:`has_any_legal_move`. Produces the same
+    ``(winner, reason)`` as :func:`check_win_with_reason` but avoids building the
+    full legal-move list for the common (non-stalemated) case. The GUI path
+    (``skip_validation=False``) still uses the full :func:`check_win_with_reason`.
+    """
+    board = game_state.board
+    blue_count = 0
+    red_count = 0
+    for piece in game_state.pieces:
+        if board.is_opponent_den(piece.col, piece.row, piece.player):
+            return piece.player, "den_entry"
+        if piece.player == Player.BLUE:
+            blue_count += 1
+        else:
+            red_count += 1
+    if blue_count == 0:
+        return Player.RED, "elimination"
+    if red_count == 0:
+        return Player.BLUE, "elimination"
+
+    current = game_state.current_player
+    if not has_any_legal_move(game_state, current):
+        return Player.RED if current == Player.BLUE else Player.BLUE, "stalemate"
+    return None, ""
 
 
 def check_win_with_reason(game_state) -> tuple[Player | None, str]:
