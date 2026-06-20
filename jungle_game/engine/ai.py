@@ -1,329 +1,179 @@
-"""AI engine for Jungle (Dou Shou Qi) using minimax with alpha-beta pruning.
+"""AI engine for Jungle (Dou Shou Qi).
 
-Features:
-- Iterative deepening with time limit
-- Alpha-beta pruning (fail-soft) with null-move pruning
-- Late move reduction (LMR) for quiet moves
-- Move ordering (captures first via MVV-LVA, den-entry moves, TT best move)
-- Transposition table with Zobrist hashing (two-bucket replacement)
-- Quiescence search to avoid horizon effect
-- Evaluation: material + position + threats + trap control + den defense + mobility + endgame
+Negamax search with alpha-beta pruning and a collection of standard
+strength-enhancing techniques:
+
+- Iterative deepening with a hard time limit
+- **Clean time abort**: when the time budget runs out the search raises
+  ``_TimeUp`` instead of returning a meaningless stand-pat score. The root
+  only commits the best move from a *fully completed* iteration, so a
+  time-aborted deep iteration never replaces a good move with a garbage one
+  (this was the critical bug in the previous implementation).
+- Principal Variation Search (PVS / zero-window) for non-first moves
+- Late move reduction (LMR) for late quiet moves
+- Null-move pruning (zero-window, side-to-move agnostic via negamax)
+- Move ordering: transposition-table best move -> winning den entry ->
+  captures (MVV-LVA) -> killer moves -> history heuristic
+- Two-bucket transposition table with Zobrist hashing and ply-aware
+  mate-score encoding/decoding
+- Quiescence search over captures and den-entry moves to avoid the horizon
+  effect
 - Node-count-based time checks for efficiency
+
+The evaluation lives in :mod:`jungle_game.engine.evaluation` and is symmetric
+(``evaluate(g, A) == -evaluate(g, B)``), which is what makes negamax valid.
 """
 
 from __future__ import annotations
 import time
-import random
+
 from jungle_game.engine.pieces import PieceType, Player
-from jungle_game.engine.rules import generate_legal_moves, check_win, is_capture_valid
+from jungle_game.engine.rules import generate_legal_moves
+from jungle_game.engine.game import GameState
+from jungle_game.engine.evaluation import evaluate, PIECE_VALUES, MATE
+from jungle_game.engine.zobrist import ZOBRIST_PIECES, ZOBRIST_SIDE
 
-# Piece material values (tuned for Jungle)
-PIECE_VALUES = {
-    PieceType.RAT: 400,
-    PieceType.CAT: 150,
-    PieceType.DOG: 400,
-    PieceType.WOLF: 450,
-    PieceType.LEOPARD: 600,
-    PieceType.TIGER: 900,
-    PieceType.LION: 1000,
-    PieceType.ELEPHANT: 950,
-}
+# Re-exported so callers can ``from jungle_game.engine.ai import evaluate``.
+__all__ = [
+    "find_best_move", "evaluate", "order_moves", "PIECE_VALUES",
+    "compute_zobrist_hash", "TranspositionTable",
+    "EXACT", "LOWERBOUND", "UPPERBOUND", "clear_tt",
+    "DEFAULT_TIME_LIMIT_MS", "NULL_MOVE_R", "LMR_MIN_DEPTH",
+]
 
-# Position bonus: Manhattan distance from opponent's den
-DEN_POSITIONS = {
-    Player.BLUE: (3, 8),
-    Player.RED: (3, 0),
-}
+DEFAULT_TIME_LIMIT_MS = 1500
 
-# Piece advancement multipliers
-ADVANCE_MULTIPLIER = {
-    PieceType.RAT: 1.2,
-    PieceType.CAT: 0.8,
-    PieceType.DOG: 0.9,
-    PieceType.WOLF: 1.0,
-    PieceType.LEOPARD: 1.0,
-    PieceType.TIGER: 1.3,
-    PieceType.LION: 1.4,
-    PieceType.ELEPHANT: 1.0,
-}
+# Null-move pruning reduction and safety threshold.
+NULL_MOVE_R = 2
+NULL_MOVE_MIN_PIECES = 3
 
-# Zobrist hashing for transposition table
-_random = random.Random(42)
-ZOBRIST_PIECES = {}
-ZOBRIST_SIDE = _random.getrandbits(64)
+# Late move reduction parameters.
+LMR_MIN_DEPTH = 3
+LMR_MOVE_INDEX = 4   # reduce moves at index >= this
+LMR_REDUCTION = 1
 
-for player in Player:
-    for ptype in PieceType:
-        for row in range(9):
-            for col in range(7):
-                ZOBRIST_PIECES[(ptype, player, col, row)] = _random.getrandbits(64)
+# Quiescence search depth cap.
+MAX_Q_DEPTH = 4
 
-# Transposition table entry types
+# Den-threat search extensions: extend depth by 1 when a move puts a piece
+# adjacent to the opponent's empty den (a forced-win threat the opponent must
+# answer, analogous to a check extension). Capped per path to avoid explosion.
+MAX_EXTENSIONS = 2
+
+# Time-check interval (nodes between time checks). Smaller => tighter time
+# compliance at the cost of marginally more time.time() calls (negligible).
+TIME_CHECK_NODES = 2048
+
+# Search bounds.
+INF = 1_000_000
+MATE_THRESHOLD = MATE - 1000   # scores with abs > this are mate scores
+MAX_PLY = 64                   # maximum search depth in plies
+MAX_ITER_DEPTH = 40            # iterative-deepening depth cap
+
+# Board index helpers for the history heuristic (7 cols x 9 rows = 63 squares).
+_NCOLS = 7
+_NROWS = 9
+_NSQ = _NCOLS * _NROWS
+
+
+def _sq(pos: tuple[int, int]) -> int:
+    return pos[1] * _NCOLS + pos[0]
+
+
+# --- Zobrist hashing -------------------------------------------------------
+# Keys live in jungle_game.engine.zobrist (shared with GameState, which maintains
+# the hash incrementally on make_move/undo_move). compute_zobrist_hash below is a
+# recompute fallback used by tests; the search uses game_state.zobrist_hash.
+
+# Transposition-table entry flags.
 EXACT = 0
 LOWERBOUND = 1
 UPPERBOUND = 2
 
-DEFAULT_TIME_LIMIT_MS = 1500
 
-# Null-move pruning reduction
-NULL_MOVE_R = 2
-# Minimum pieces per side for null-move to be safe
-NULL_MOVE_MIN_PIECES = 3
-
-# LMR: reduce depth for moves after the first few
-LMR_MIN_DEPTH = 3
-LMR_MOVE_INDEX = 4  # Reduce moves at index >= this
-LMR_REDUCTION = 1
-
-# Time check interval (nodes between time checks)
-TIME_CHECK_NODES = 4096
-
-# Orthogonal directions
-DIRECTIONS = ((0, -1), (0, 1), (-1, 0), (1, 0))
-
-
-def compute_zobrist_hash(game_state) -> int:
-    """Compute Zobrist hash for the current game state."""
+def compute_zobrist_hash(game_state: GameState) -> int:
+    """Compute the Zobrist hash for the current game state."""
     h = 0
     for piece in game_state.pieces:
-        key = (piece.piece_type, piece.player, piece.col, piece.row)
-        h ^= ZOBRIST_PIECES.get(key, 0)
+        h ^= ZOBRIST_PIECES.get((piece.piece_type, piece.player, piece.col, piece.row), 0)
     if game_state.current_player == Player.RED:
         h ^= ZOBRIST_SIDE
     return h
 
 
-def evaluate(game_state, player: Player) -> int:
-    """Evaluate the position from the given player's perspective.
+def _opponent(player: Player) -> Player:
+    return Player.RED if player == Player.BLUE else Player.BLUE
 
-    Positive = good for player, negative = bad.
-    """
-    winner = check_win(game_state)
-    if winner == player:
-        return 100000
-    if winner is not None and winner != player:
-        return -100000
 
-    score = 0
-    board = game_state.board
-    opp = Player.RED if player == Player.BLUE else Player.BLUE
-    target_den = DEN_POSITIONS[player]
-    own_den = DEN_POSITIONS[opp]
-
-    pieces_by_pos = game_state.pieces_by_pos
-    own_pieces = []
-    opp_pieces = []
-    for piece in game_state.pieces:
-        if piece.player == player:
-            own_pieces.append(piece)
-        else:
-            opp_pieces.append(piece)
-
-    total_pieces = len(own_pieces) + len(opp_pieces)
-    is_endgame = total_pieces <= 6
-    endgame_mult = 1.5 if is_endgame else 1.0
-
-    # Den threat tracking
-    opp_near_own_den = 0  # opponent pieces near our den
-    own_near_own_den = []  # (piece, distance) near our den
-
-    for piece in own_pieces:
-        value = PIECE_VALUES[piece.piece_type]
-
-        # Material
-        score += value
-
-        # Position: bonus for being closer to opponent's den
-        dist_to_den = abs(piece.col - target_den[0]) + abs(piece.row - target_den[1])
-        multiplier = ADVANCE_MULTIPLIER.get(piece.piece_type, 1.0)
-        score += int((16 - dist_to_den) * 20 * multiplier * endgame_mult)
-
-        # Penalty for being near own den
-        dist_from_own = abs(piece.col - own_den[0]) + abs(piece.row - own_den[1])
-        if dist_from_own < 3:
-            score -= (3 - dist_from_own) * 25
-            own_near_own_den.append((piece, dist_from_own))
-
-        # Penalty if our piece is in opponent's trap
-        if board.is_opponent_trap(piece.col, piece.row, piece.player):
-            score -= value // 2
-
-        # Den threat tracking
-        if dist_from_own <= 3:
-            pass  # already tracked above
-
-        # Threat bonus
-        for dc, dr in DIRECTIONS:
-            nc, nr = piece.col + dc, piece.row + dr
-            target = pieces_by_pos.get((nc, nr))
-            if target is not None and target.player == opp:
-                if is_capture_valid(piece.piece_type, piece.player,
-                                    piece.col, piece.row, target, board):
-                    score += PIECE_VALUES[target.piece_type] // 4
-
-    for piece in opp_pieces:
-        value = PIECE_VALUES[piece.piece_type]
-
-        # Material
-        score -= value
-
-        # Position: opponent closer to our den is threatening
-        dist_to_our_den = abs(piece.col - own_den[0]) + abs(piece.row - own_den[1])
-        score -= int((16 - dist_to_our_den) * 15 * endgame_mult)
-
-        # Opponent in our trap = good for us
-        if board.is_opponent_trap(piece.col, piece.row, piece.player):
-            score += value // 2
-
-        # Track opponent den proximity
-        if dist_to_our_den <= 3:
-            opp_near_own_den += 1
-
-        # Penalty if opponent threatens our pieces
-        for dc, dr in DIRECTIONS:
-            nc, nr = piece.col + dc, piece.row + dr
-            target = pieces_by_pos.get((nc, nr))
-            if target is not None and target.player == player:
-                if is_capture_valid(piece.piece_type, piece.player,
-                                    piece.col, piece.row, target, board):
-                    score -= PIECE_VALUES[target.piece_type] // 5
-
-    # Den defense bonus: reward defenders when opponent threatens our den
-    if opp_near_own_den > 0:
-        for piece, dist in own_near_own_den:
-            score += (3 - dist) * 40
-
-    # Mobility: cheap approximation (count open orthogonal neighbors)
-    for piece in own_pieces:
-        mobility = 0
-        for dc, dr in DIRECTIONS:
-            nc, nr = piece.col + dc, piece.row + dr
-            if not board.in_bounds(nc, nr):
-                continue
-            if board.is_water(nc, nr) and not piece.can_enter_water():
-                continue
-            if board.is_own_den(nc, nr, piece.player):
-                continue
-            blocker = pieces_by_pos.get((nc, nr))
-            if blocker is not None and blocker.player == player:
-                continue
-            mobility += 1
-        score += mobility * 5
-
-    # Endgame knowledge
-    if is_endgame:
-        own_types = {p.piece_type for p in own_pieces}
-        opp_types = {p.piece_type for p in opp_pieces}
-
-        # Rat can threaten Elephant: bonus if opponent has Elephant and we have Rat
-        if PieceType.RAT in own_types and PieceType.ELEPHANT in opp_types:
-            score += 200
-
-        # Dominant piece: Lion/Tiger with no Rat on opponent side
-        if (PieceType.LION in own_types or PieceType.TIGER in own_types) and PieceType.RAT not in opp_types:
-            score += 300
-
-        # One move from den: check if any piece can enter den
-        for piece in own_pieces:
-            for dc, dr in DIRECTIONS:
-                nc, nr = piece.col + dc, piece.row + dr
-                if board.in_bounds(nc, nr) and board.is_opponent_den(nc, nr, piece.player):
-                    blocker = pieces_by_pos.get((nc, nr))
-                    if blocker is None:
-                        score += 5000
-
+def _tt_encode(score: int, ply: int) -> int:
+    """Make a mate score ply-independent before storing in the TT."""
+    if score > MATE_THRESHOLD:
+        return score + ply
+    if score < -MATE_THRESHOLD:
+        return score - ply
     return score
 
 
-def order_moves(moves, game_state) -> list:
-    """Order moves for better alpha-beta pruning.
-
-    Priority:
-    1. Captures (sorted by MVV-LVA)
-    2. Den-entry moves
-    3. Other moves
-    """
-    pieces_by_pos = game_state.pieces_by_pos
-    scored_moves = []
-
-    for from_pos, to_pos in moves:
-        priority = 0
-        target = pieces_by_pos.get(to_pos)
-
-        if target is not None:
-            victim_value = PIECE_VALUES[target.piece_type]
-            attacker = pieces_by_pos.get(from_pos)
-            attacker_value = PIECE_VALUES[attacker.piece_type] if attacker else 0
-            priority = 10000 + victim_value * 10 - attacker_value
-        elif game_state.board.is_opponent_den(to_pos[0], to_pos[1],
-                                               game_state.current_player):
-            priority = 5000
-
-        scored_moves.append((priority, from_pos, to_pos))
-
-    scored_moves.sort(key=lambda x: x[0], reverse=True)
-    return [(fp, tp) for _, fp, tp in scored_moves]
+def _tt_decode(score: int, ply: int) -> int:
+    """Restore a mate score to the current ply after retrieving from the TT."""
+    if score > MATE_THRESHOLD:
+        return score - ply
+    if score < -MATE_THRESHOLD:
+        return score + ply
+    return score
 
 
 class TranspositionTable:
-    """Two-bucket transposition table using Zobrist hashing.
+    """Two-bucket transposition table (depth-preferred + always-replace)."""
 
-    Uses depth-preferred + always-replace buckets for better retention.
-    """
-
-    def __init__(self, depth_size=500_000, always_size=500_000):
-        self._depth_table = {}
-        self._always_table = {}
+    def __init__(self, depth_size: int = 500_000, always_size: int = 500_000):
+        self._depth_table: dict[int, dict] = {}
+        self._always_table: dict[int, dict] = {}
         self._depth_max = depth_size
         self._always_max = always_size
 
-    def lookup(self, hash_key: int, depth: int):
-        """Look up a position. Returns (score, flag, best_move) or None."""
-        # Check depth-preferred table first
+    def lookup(self, hash_key: int, depth: int) -> tuple[int, int, tuple] | None:
+        """Return (score, flag, best_move) for a sufficient-depth entry, or None."""
         entry = self._depth_table.get(hash_key)
         if entry is not None and entry['depth'] >= depth:
             return entry['score'], entry['flag'], entry['best_move']
-        # Check always-replace table
         entry = self._always_table.get(hash_key)
         if entry is not None and entry['depth'] >= depth:
             return entry['score'], entry['flag'], entry['best_move']
         return None
 
-    def store(self, hash_key: int, depth: int, score: int, flag: int, best_move):
-        """Store a position in both tables."""
-        # Always store in always-replace table
+    def store(self, hash_key: int, depth: int, score: int, flag: int,
+              best_move: tuple | None) -> None:
+        """Store a position in both buckets."""
+        record = {'depth': depth, 'score': score, 'flag': flag, 'best_move': best_move}
+
         if len(self._always_table) >= self._always_max:
             self._always_table.clear()
-        self._always_table[hash_key] = {
-            'depth': depth,
-            'score': score,
-            'flag': flag,
-            'best_move': best_move,
-        }
+        self._always_table[hash_key] = record
 
-        # Store in depth-preferred table only if deeper or equal
         existing = self._depth_table.get(hash_key)
         if existing is not None and existing['depth'] > depth:
             return
         if len(self._depth_table) >= self._depth_max:
             self._depth_table.clear()
-        self._depth_table[hash_key] = {
-            'depth': depth,
-            'score': score,
-            'flag': flag,
-            'best_move': best_move,
-        }
+        self._depth_table[hash_key] = record
 
     def clear(self):
         self._depth_table.clear()
         self._always_table.clear()
 
 
-# Persistent transposition table
+# Persistent transposition table and per-search state.
 _tt = TranspositionTable()
-
-# Node counter for time checks
 _node_count = 0
+_history: list[int] = []          # [_NSQ * _NSQ] flat array, reset per search
+_killers: list[list] = []         # [[move, move], ...] per ply, reset per search
+_last_depth = 0                   # depth of the last completed iteration
+# Den-threat extensions are OFF by default: self-play measurement (see
+# scripts/elo_match.py) found them net-harmful at the tested time control (the
+# engine over-commits to refutable den attacks). They remain selectable via
+# set_extensions_enabled(True) for experimentation.
+_extensions_enabled = False
 
 
 def clear_tt():
@@ -331,280 +181,380 @@ def clear_tt():
     _tt.clear()
 
 
-def _quiescence(game_state, alpha: int, beta: int, maximizing: bool,
-                player: Player, start_time: float, time_limit: float,
-                q_depth: int = 0, max_q_depth: int = 3) -> int:
-    """Quiescence search: extend search on captures to avoid horizon effect."""
+def set_extensions_enabled(enabled: bool) -> None:
+    """Toggle den-threat search extensions (used by the elo-match harness)."""
+    global _extensions_enabled
+    _extensions_enabled = enabled
+
+
+def _reset_search_state():
+    """Reset history and killer tables for a new search."""
+    global _history, _killers
+    _history = [0] * (_NSQ * _NSQ)
+    _killers = [[None, None] for _ in range(MAX_PLY)]
+
+
+class _TimeUp(Exception):
+    """Raised internally when the search budget is exhausted."""
+
+
+def _time_up(start_time: float, time_limit: float) -> bool:
+    return _node_count % TIME_CHECK_NODES == 0 and time.time() - start_time > time_limit
+
+
+def _is_capture_or_den(game_state, pieces_by_pos, to_pos, current) -> tuple[bool, bool]:
+    """Return (is_capture, is_winning_den_entry) for a move's destination."""
+    target = pieces_by_pos.get(to_pos)
+    is_capture = target is not None
+    is_den = game_state.board.is_opponent_den(to_pos[0], to_pos[1], current)
+    return is_capture, is_den
+
+
+def order_moves(moves: list, game_state: GameState, tt_move: tuple | None = None,
+                killers: list | None = None, history: list | None = None) -> list:
+    """Order moves for better alpha-beta pruning.
+
+    Priority (highest first):
+    1. Transposition-table best move
+    2. Winning den-entry moves
+    3. Captures (MVV-LVA: most valuable victim, least valuable attacker)
+    4. Killer moves (quiet cutoff moves)
+    5. History heuristic score
+    6. Remaining quiet moves
+
+    The public 2-argument form ``order_moves(moves, game_state)`` keeps the
+    captures-first / den-entry-prioritised behaviour relied on by tests.
+    """
+    pieces_by_pos = game_state.pieces_by_pos
+    current = game_state.current_player
+    board = game_state.board
+    scored = []
+
+    killer_set = set(killers) if killers else set()
+
+    for from_pos, to_pos in moves:
+        if tt_move is not None and (from_pos, to_pos) == tt_move:
+            priority = 1_000_000
+        elif board.is_opponent_den(to_pos[0], to_pos[1], current):
+            priority = 900_000
+        else:
+            target = pieces_by_pos.get(to_pos)
+            if target is not None:
+                victim = PIECE_VALUES[target.piece_type]
+                attacker = pieces_by_pos.get(from_pos)
+                attacker_value = PIECE_VALUES[attacker.piece_type] if attacker else 0
+                priority = 100_000 + victim * 16 - attacker_value
+            elif (from_pos, to_pos) in killer_set:
+                priority = 80_000
+            elif history is not None:
+                priority = history[_sq(from_pos) * _NSQ + _sq(to_pos)]
+            else:
+                priority = 0
+        scored.append((priority, from_pos, to_pos))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(fp, tp) for _, fp, tp in scored]
+
+
+def _order_quiescence(moves, game_state) -> list:
+    """Order quiescence moves (captures + den entries) by MVV-LVA / den value."""
+    pieces_by_pos = game_state.pieces_by_pos
+    current = game_state.current_player
+    board = game_state.board
+    scored = []
+    for from_pos, to_pos in moves:
+        if board.is_opponent_den(to_pos[0], to_pos[1], current):
+            priority = 900_000
+        else:
+            target = pieces_by_pos.get(to_pos)
+            victim = PIECE_VALUES[target.piece_type]
+            attacker = pieces_by_pos.get(from_pos)
+            attacker_value = PIECE_VALUES[attacker.piece_type] if attacker else 0
+            priority = 100_000 + victim * 16 - attacker_value
+        scored.append((priority, from_pos, to_pos))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(fp, tp) for _, fp, tp in scored]
+
+
+def _quiescence(game_state, alpha: int, beta: int, ply: int,
+                start_time: float, time_limit: float, q_depth: int) -> int:
+    """Quiescence search: extend on captures and den-entry moves.
+
+    Returns a score from the side-to-move's perspective (negamax convention).
+    """
     global _node_count
     _node_count += 1
+    if _time_up(start_time, time_limit):
+        raise _TimeUp()
 
-    # Time check (every N nodes)
-    if _node_count % TIME_CHECK_NODES == 0:
-        if time.time() - start_time > time_limit:
-            return evaluate(game_state, player)
-
-    stand_pat = evaluate(game_state, player)
-
+    # Terminal positions (winner already set by the move that led here).
     if game_state.is_over:
-        return stand_pat
+        winner = game_state._winner
+        if winner == game_state.current_player:
+            return MATE - ply
+        return -MATE + ply
 
-    if maximizing:
-        if stand_pat >= beta:
-            return stand_pat
-        if stand_pat > alpha:
-            alpha = stand_pat
-    else:
-        if stand_pat <= alpha:
-            return stand_pat
-        if stand_pat < beta:
-            beta = stand_pat
-
-    if q_depth >= max_q_depth:
+    stand_pat = evaluate(game_state, game_state.current_player)
+    if stand_pat >= beta:
         return stand_pat
+    if stand_pat > alpha:
+        alpha = stand_pat
+    if q_depth >= MAX_Q_DEPTH:
+        return alpha
 
     current = game_state.current_player
-    moves = generate_legal_moves(game_state, current)
-
-    capture_moves = []
     pieces_by_pos = game_state.pieces_by_pos
-    for from_pos, to_pos in moves:
+    board = game_state.board
+
+    # Only consider forcing moves: captures and immediate den entries.
+    forcing = []
+    for from_pos, to_pos in generate_legal_moves(game_state, current):
         target = pieces_by_pos.get(to_pos)
-        if target is not None:
-            capture_moves.append((from_pos, to_pos))
-        elif game_state.board.is_opponent_den(to_pos[0], to_pos[1], current):
-            capture_moves.append((from_pos, to_pos))
+        if target is not None or board.is_opponent_den(to_pos[0], to_pos[1], current):
+            forcing.append((from_pos, to_pos))
+    if not forcing:
+        return alpha
 
-    if not capture_moves:
-        return stand_pat
-
-    capture_moves = order_moves(capture_moves, game_state)
-
-    if maximizing:
-        max_eval = stand_pat
-        for from_pos, to_pos in capture_moves:
-            if _node_count % TIME_CHECK_NODES == 0 and time.time() - start_time > time_limit:
-                break
-            game_state.make_move(from_pos, to_pos, skip_validation=True)
-            eval_score = _quiescence(game_state, alpha, beta, False, player,
-                                     start_time, time_limit, q_depth + 1,
-                                     max_q_depth)
+    best = stand_pat
+    for from_pos, to_pos in _order_quiescence(forcing, game_state):
+        game_state.make_move(from_pos, to_pos, skip_validation=True)
+        try:
+            score = -_quiescence(game_state, -beta, -alpha, ply + 1,
+                                 start_time, time_limit, q_depth + 1)
+        finally:
             game_state.undo_move()
-            if eval_score > max_eval:
-                max_eval = eval_score
-            alpha = max(alpha, eval_score)
-            if beta <= alpha:
-                break
-        return max_eval
-    else:
-        min_eval = stand_pat
-        for from_pos, to_pos in capture_moves:
-            if _node_count % TIME_CHECK_NODES == 0 and time.time() - start_time > time_limit:
-                break
-            game_state.make_move(from_pos, to_pos, skip_validation=True)
-            eval_score = _quiescence(game_state, alpha, beta, True, player,
-                                     start_time, time_limit, q_depth + 1,
-                                     max_q_depth)
-            game_state.undo_move()
-            if eval_score < min_eval:
-                min_eval = eval_score
-            beta = min(beta, eval_score)
-            if beta <= alpha:
-                break
-        return min_eval
+        if score >= beta:
+            return score
+        if score > best:
+            best = score
+            if best > alpha:
+                alpha = best
+    return best
 
 
 def _count_pieces(game_state, player: Player) -> int:
-    """Count pieces for a player."""
-    count = 0
-    for p in game_state.pieces:
-        if p.player == player:
-            count += 1
-    return count
+    return sum(1 for p in game_state.pieces if p.player == player)
 
 
-def _alpha_beta(game_state, depth: int, alpha: int, beta: int,
-                maximizing: bool, player: Player,
-                start_time: float, time_limit: float) -> int:
-    """Alpha-beta search with null-move pruning, LMR, and transposition table."""
-    global _node_count
+# Dens each side attacks (mover wins by entering the opponent's den).
+_DEN_TARGET = {Player.BLUE: (3, 8), Player.RED: (3, 0)}
+
+
+def _move_creates_den_threat(game_state, to_pos: tuple[int, int],
+                              mover: Player) -> bool:
+    """True if the just-moved piece now threatens to enter the opponent's den.
+
+    The piece at ``to_pos`` (belonging to ``mover``) is a forced-win threat when
+    it is orthogonally adjacent to ``mover``'s target den AND that den is empty —
+    the opponent must respond or lose next move. Used for the den-threat
+    (check-style) search extension.
+    """
+    target_den = _DEN_TARGET[mover]
+    if abs(to_pos[0] - target_den[0]) + abs(to_pos[1] - target_den[1]) != 1:
+        return False
+    return game_state.pieces_by_pos.get(target_den) is None
+
+
+def _negamax(game_state, depth: int, alpha: int, beta: int, ply: int,
+             start_time: float, time_limit: float, can_null: bool = True,
+             ext_left: int = MAX_EXTENSIONS) -> int:
+    """Negamax with PVS, null-move pruning, LMR, killers, history and the TT.
+
+    Returns a score from the side-to-move's perspective. ``ext_left`` bounds the
+    number of den-threat extensions remaining on the current search path.
+    """
+    global _node_count, _history, _killers
     _node_count += 1
+    if _time_up(start_time, time_limit):
+        raise _TimeUp()
 
-    # Time check (every N nodes)
-    if _node_count % TIME_CHECK_NODES == 0:
-        if time.time() - start_time > time_limit:
-            return evaluate(game_state, player)
+    # Terminal: the move that led here already ended the game.
+    if game_state.is_over:
+        winner = game_state._winner
+        if winner == game_state.current_player:
+            return MATE - ply
+        return -MATE + ply
 
-    hash_key = compute_zobrist_hash(game_state)
-
-    # Transposition table lookup
+    hash_key = game_state.zobrist_hash
+    tt_move = None
     tt_entry = _tt.lookup(hash_key, depth)
     if tt_entry is not None:
-        score, flag, _ = tt_entry
-        if flag == EXACT:
-            return score
-        elif flag == LOWERBOUND and score > alpha:
-            alpha = score
-        elif flag == UPPERBOUND and score < beta:
-            beta = score
+        tt_score, tt_flag, tt_move = tt_entry
+        tt_score = _tt_decode(tt_score, ply)
+        if tt_flag == EXACT:
+            return tt_score
+        if tt_flag == LOWERBOUND and tt_score > alpha:
+            alpha = tt_score
+        elif tt_flag == UPPERBOUND and tt_score < beta:
+            beta = tt_score
         if alpha >= beta:
-            return score
+            return tt_score
 
-    # Terminal check
-    winner = check_win(game_state)
-    if winner is not None:
-        if winner == player:
-            return 100000 + depth
-        return -100000 - depth
-
-    if depth == 0:
-        return _quiescence(game_state, alpha, beta, maximizing, player,
-                           start_time, time_limit)
+    if depth <= 0:
+        return _quiescence(game_state, alpha, beta, ply, start_time, time_limit, 0)
 
     current = game_state.current_player
+    opp = _opponent(current)
     moves = generate_legal_moves(game_state, current)
     if not moves:
-        if current == player:
-            return -100000
-        return 100000
+        return -MATE + ply   # stalemate: side to move loses (safety net)
 
-    moves = order_moves(moves, game_state)
-
-    # Try TT best move first
-    if tt_entry is not None:
-        _, _, best_move_tt = tt_entry
-        if best_move_tt is not None and best_move_tt in moves:
-            moves.remove(best_move_tt)
-            moves.insert(0, best_move_tt)
-
-    # Null-move pruning (maximizing side only, not in endgame)
-    own_count = _count_pieces(game_state, player)
-    opp_count = _count_pieces(game_state, Player.RED if player == Player.BLUE else Player.BLUE)
-    if (maximizing and depth >= 3
-            and own_count >= NULL_MOVE_MIN_PIECES
-            and opp_count >= NULL_MOVE_MIN_PIECES):
-        # Skip the current player's turn
-        game_state.current_player = Player.RED if game_state.current_player == Player.BLUE else Player.BLUE
-        null_score = _alpha_beta(game_state, depth - 1 - NULL_MOVE_R,
-                                 alpha, beta, False, player,
-                                 start_time, time_limit)
-        game_state.current_player = Player.RED if game_state.current_player == Player.BLUE else Player.BLUE
-        if null_score >= beta:
-            return beta
-
-    best_move = moves[0]
+    moves = order_moves(moves, game_state, tt_move, _killers[ply], _history)
     pieces_by_pos = game_state.pieces_by_pos
+    board = game_state.board
 
-    if maximizing:
-        orig_alpha = alpha
-        max_eval = -999999
-        for move_idx, (from_pos, to_pos) in enumerate(moves):
-            if _node_count % TIME_CHECK_NODES == 0 and time.time() - start_time > time_limit:
-                break
+    # Null-move pruning: pass and search at reduced depth; fail-high => cutoff.
+    # Only worth it from depth 3, so skip the (cheap but repeated) piece counts
+    # at shallower nodes where the bulk of the tree lives.
+    if can_null and depth >= 3:
+        own_count = _count_pieces(game_state, current)
+        opp_count = _count_pieces(game_state, opp)
+        if own_count >= NULL_MOVE_MIN_PIECES and opp_count >= NULL_MOVE_MIN_PIECES:
+            # Flip the side-to-move AND the incremental hash's side key together
+            # so the child reads the correct zobrist_hash for the passed position
+            # (a direct current_player assignment alone leaves the hash stale,
+            # causing wrong TT cutoffs and TT pollution under time abort).
+            game_state.current_player = opp
+            game_state._zobrist ^= ZOBRIST_SIDE
+            try:
+                null_score = -_negamax(game_state, depth - 1 - NULL_MOVE_R,
+                                       -beta, -beta + 1, ply + 1,
+                                       start_time, time_limit, can_null=False,
+                                       ext_left=ext_left)
+            finally:
+                game_state.current_player = current
+                game_state._zobrist ^= ZOBRIST_SIDE
+            if null_score >= beta:
+                return null_score
 
-            # Late move reduction for quiet moves
-            target = pieces_by_pos.get(to_pos)
-            is_capture = target is not None
-            is_den_entry = game_state.board.is_opponent_den(to_pos[0], to_pos[1], current)
-            do_reduce = (move_idx >= LMR_MOVE_INDEX and depth >= LMR_MIN_DEPTH
-                         and not is_capture and not is_den_entry)
+    best = -INF
+    best_move = None
+    orig_alpha = alpha
 
-            game_state.make_move(from_pos, to_pos, skip_validation=True)
+    for move_idx, (from_pos, to_pos) in enumerate(moves):
+        is_capture, is_den = _is_capture_or_den(game_state, pieces_by_pos, to_pos, current)
+        is_quiet = not is_capture and not is_den
 
-            if do_reduce:
-                # Search with reduced depth
-                eval_score = _alpha_beta(game_state, depth - 1 - LMR_REDUCTION,
-                                         alpha, beta, False, player,
-                                         start_time, time_limit)
-                # Re-search at full depth if it raises alpha
-                if eval_score > alpha:
-                    eval_score = _alpha_beta(game_state, depth - 1,
-                                             alpha, beta, False, player,
-                                             start_time, time_limit)
+        game_state.make_move(from_pos, to_pos, skip_validation=True)
+        # Den-threat extension: if this move puts the mover's piece next to the
+        # opponent's empty den (a forced-win threat), search at full depth
+        # instead of depth-1. Capped per path via ext_left.
+        extend = (_extensions_enabled and ext_left > 0
+                  and _move_creates_den_threat(game_state, to_pos, current))
+        child_depth = depth if extend else depth - 1
+        child_ext = ext_left - 1 if extend else ext_left
+        try:
+            if move_idx == 0:
+                # First (expected-best) move: full window.
+                score = -_negamax(game_state, child_depth, -beta, -alpha, ply + 1,
+                                  start_time, time_limit, ext_left=child_ext)
             else:
-                eval_score = _alpha_beta(game_state, depth - 1, alpha, beta,
-                                         False, player, start_time, time_limit)
-
+                # Late move reduction for late quiet moves (not applied when
+                # extending, since child_depth is already full depth).
+                if (not extend and move_idx >= LMR_MOVE_INDEX
+                        and depth >= LMR_MIN_DEPTH and is_quiet):
+                    score = -_negamax(game_state, child_depth - LMR_REDUCTION,
+                                      -alpha - 1, -alpha, ply + 1,
+                                      start_time, time_limit, ext_left=child_ext)
+                else:
+                    score = -_negamax(game_state, child_depth, -alpha - 1, -alpha,
+                                      ply + 1, start_time, time_limit, ext_left=child_ext)
+                # Re-search with the full window if the reduced/zero-window beat alpha.
+                if score > alpha and score < beta:
+                    score = -_negamax(game_state, child_depth, -beta, -alpha, ply + 1,
+                                      start_time, time_limit, ext_left=child_ext)
+        finally:
+            # Keep make/undo paired even when a _TimeUp abort propagates up.
             game_state.undo_move()
 
-            if eval_score > max_eval:
-                max_eval = eval_score
-                best_move = (from_pos, to_pos)
+        if score > best:
+            best = score
+            best_move = (from_pos, to_pos)
+            if best > alpha:
+                alpha = best
 
-            alpha = max(alpha, eval_score)
-            if beta <= alpha:
-                break
+        if alpha >= beta:
+            # Beta cutoff: record quiet cutoff moves for future ordering.
+            if is_quiet:
+                _record_killer(ply, (from_pos, to_pos))
+                _history[_sq(from_pos) * _NSQ + _sq(to_pos)] += depth * depth
+            break
 
-        if max_eval <= orig_alpha:
-            flag = UPPERBOUND
-        elif max_eval >= beta:
-            flag = LOWERBOUND
-        else:
-            flag = EXACT
-        _tt.store(hash_key, depth, max_eval, flag, best_move)
-        return max_eval
+    if best <= orig_alpha:
+        flag = UPPERBOUND
+    elif best >= beta:
+        flag = LOWERBOUND
     else:
-        orig_beta = beta
-        min_eval = 999999
-        for move_idx, (from_pos, to_pos) in enumerate(moves):
-            if _node_count % TIME_CHECK_NODES == 0 and time.time() - start_time > time_limit:
-                break
-
-            target = pieces_by_pos.get(to_pos)
-            is_capture = target is not None
-            is_den_entry = game_state.board.is_opponent_den(to_pos[0], to_pos[1], current)
-            do_reduce = (move_idx >= LMR_MOVE_INDEX and depth >= LMR_MIN_DEPTH
-                         and not is_capture and not is_den_entry)
-
-            game_state.make_move(from_pos, to_pos, skip_validation=True)
-
-            if do_reduce:
-                eval_score = _alpha_beta(game_state, depth - 1 - LMR_REDUCTION,
-                                         alpha, beta, True, player,
-                                         start_time, time_limit)
-                if eval_score < beta:
-                    eval_score = _alpha_beta(game_state, depth - 1,
-                                             alpha, beta, True, player,
-                                             start_time, time_limit)
-            else:
-                eval_score = _alpha_beta(game_state, depth - 1, alpha, beta,
-                                         True, player, start_time, time_limit)
-
-            game_state.undo_move()
-
-            if eval_score < min_eval:
-                min_eval = eval_score
-                best_move = (from_pos, to_pos)
-
-            beta = min(beta, eval_score)
-            if beta <= alpha:
-                break
-
-        if min_eval >= orig_beta:
-            flag = LOWERBOUND
-        elif min_eval <= alpha:
-            flag = UPPERBOUND
-        else:
-            flag = EXACT
-        _tt.store(hash_key, depth, min_eval, flag, best_move)
-        return min_eval
+        flag = EXACT
+    _tt.store(hash_key, depth, _tt_encode(best, ply), flag, best_move)
+    return best
 
 
-def find_best_move(game_state, player: Player = None,
-                   time_limit_ms: int = DEFAULT_TIME_LIMIT_MS) -> tuple | None:
-    """Find the best move using iterative deepening alpha-beta search.
+def _record_killer(ply: int, move):
+    """Store a quiet cutoff move in the killer slots (no duplicates)."""
+    killers = _killers[ply]
+    if killers[0] == move:
+        return
+    killers[1] = killers[0]
+    killers[0] = move
 
-    Returns (from_pos, to_pos) or None if no moves available.
+
+def _search_root(game_state: GameState, moves: list, depth: int,
+                 alpha: int, beta: int, start_time: float,
+                 time_limit: float) -> tuple:
+    """Search all root moves at ``depth`` within [alpha, beta].
+
+    Returns (best_move, best_score). Raises ``_TimeUp`` if the budget runs out
+    mid-iteration (the caller discards the partial result).
     """
-    global _node_count
+    depth_best = None
+    depth_best_score = -INF
+    for from_pos, to_pos in moves:
+        game_state.make_move(from_pos, to_pos, skip_validation=True)
+        try:
+            score = -_negamax(game_state, depth - 1, -beta, -alpha, 1,
+                              start_time, time_limit, ext_left=MAX_EXTENSIONS)
+        finally:
+            game_state.undo_move()
+        if score > depth_best_score:
+            depth_best_score = score
+            depth_best = (from_pos, to_pos)
+            if score > alpha:
+                alpha = score
+    return depth_best, depth_best_score
+
+
+def find_best_move(game_state: GameState, player: Player | None = None,
+                   time_limit_ms: int = DEFAULT_TIME_LIMIT_MS) -> tuple | None:
+    """Find the best move using iterative-deepening negamax search.
+
+    Returns ``(from_pos, to_pos)`` or ``None`` if the player has no legal moves
+    (or the game is already over). ``player`` must equal the side to move
+    (``game_state.current_player``); pass ``None`` to use the side to move.
+
+    Only the result of a *fully completed* iteration is ever returned: if the
+    time budget runs out partway through a deeper iteration, that partial
+    result is discarded and the best move from the last completed depth is used.
+    """
+    global _node_count, _last_depth
     _node_count = 0
+    _last_depth = 0
+    _reset_search_state()
 
     if player is None:
         player = game_state.current_player
+    elif player != game_state.current_player:
+        raise ValueError(
+            f"player ({player}) must equal the side to move "
+            f"({game_state.current_player})")
+
+    # A terminal position has no move to make.
+    if game_state.is_over:
+        return None
 
     moves = generate_legal_moves(game_state, player)
     if not moves:
         return None
-
     if len(moves) == 1:
         return moves[0]
 
@@ -612,37 +562,36 @@ def find_best_move(game_state, player: Player = None,
     time_limit = time_limit_ms / 1000.0
 
     best_move = moves[0]
+    best_score = -INF
+    completed_depth = 0
 
-    # Iterative deepening
-    for depth in range(1, 20):
-        if time.time() - start_time > time_limit * 0.8:
+    for depth in range(1, MAX_ITER_DEPTH):
+        # Full-window search each iteration. (Aspiration windows were tried but
+        # removed: a narrow window combined with null-move pruning could return
+        # an optimistic "exact" bound for a losing move — the classic fail-soft
+        # over-pruning inside a tight window. The full window is verified correct
+        # at every depth and only sacrifices a small root-level speedup.)
+        alpha = -INF
+        beta = INF
+
+        ordered = order_moves(moves, game_state, best_move, _killers[0], _history)
+
+        try:
+            depth_best, depth_best_score = _search_root(
+                game_state, ordered, depth, alpha, beta, start_time, time_limit)
+            if depth_best is not None:
+                best_move = depth_best
+                best_score = depth_best_score
+                completed_depth = depth
+        except _TimeUp:
+            # Partial iteration discarded; keep the last completed best_move.
+            # The aborted work still filled the transposition table, which helps
+            # the next move's search.
             break
 
-        current_best = None
-        current_best_score = -999999
+        # Stop early on a forced win/loss found at this depth.
+        if abs(best_score) > MATE_THRESHOLD:
+            break
 
-        ordered_moves = order_moves(moves, game_state)
-
-        # Try TT best move first from previous iteration
-        if best_move in ordered_moves:
-            ordered_moves.remove(best_move)
-            ordered_moves.insert(0, best_move)
-
-        for from_pos, to_pos in ordered_moves:
-            if _node_count % TIME_CHECK_NODES == 0 and time.time() - start_time > time_limit * 0.9:
-                break
-
-            game_state.make_move(from_pos, to_pos, skip_validation=True)
-            score = _alpha_beta(game_state, depth - 1, -999999, 999999,
-                                False, player, start_time,
-                                time_limit - (time.time() - start_time))
-            game_state.undo_move()
-
-            if score > current_best_score:
-                current_best_score = score
-                current_best = (from_pos, to_pos)
-
-        if current_best is not None:
-            best_move = current_best
-
+    _last_depth = completed_depth
     return best_move

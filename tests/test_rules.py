@@ -254,6 +254,30 @@ class TestTrapRules:
         board = Board()
         assert _effective_rank(dog, board) == 3  # Full rank
 
+    def test_attacker_can_capture_piece_in_defenders_own_trap(self):
+        """A higher-rank attacker can capture a lower-rank defender sitting in the
+        defender's OWN trap (the trap does not shield the owner's pieces)."""
+        # Red Cat (rank 2) in Red's OWN trap (3,7); Blue Elephant (rank 8) adjacent.
+        elephant = Piece(PieceType.ELEPHANT, Player.BLUE, 2, 7)
+        cat_in_own_trap = Piece(PieceType.CAT, Player.RED, 3, 7)
+        game = make_game_with_pieces([elephant, cat_in_own_trap])
+        moves = generate_legal_moves(game, Player.BLUE)
+        assert ((2, 7), (3, 7)) in moves, \
+            "Elephant should capture the Cat in the Cat's own trap"
+
+    def test_trapped_attacker_is_rank_zero_for_capture(self):
+        """A piece currently in the opponent's trap is rank 0 and cannot capture a
+        defender it would otherwise beat (only a rank-0 defender is capturable)."""
+        # Blue Cat (rank 2) currently in Red's trap (3,7) -> effective rank 0;
+        # Red Rat (rank 1) adjacent at (3,6). An un-trapped Cat (2) would capture
+        # the Rat (1), but the trapped Cat is rank 0 and must NOT capture it.
+        trapped_cat = Piece(PieceType.CAT, Player.BLUE, 3, 7)   # in Red's trap
+        rat = Piece(PieceType.RAT, Player.RED, 3, 6)
+        game = make_game_with_pieces([trapped_cat, rat])
+        moves = generate_legal_moves(game, Player.BLUE)
+        assert ((3, 7), (3, 6)) not in moves, \
+            "Trapped (rank-0) Cat must not capture the Rat it would otherwise beat"
+
 
 class TestCaptureRules:
     def test_higher_rank_captures_lower(self):
